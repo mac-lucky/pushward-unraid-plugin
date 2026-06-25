@@ -19,8 +19,8 @@ cat <<EOF
 ================================================================
   PushWard Unraid plugin installed.
 
-  Configure your API key at:  Settings -> PushWard
-  Live Activities dashboard:  Settings -> PushWard Activities
+  Find it under:  Settings -> User Utilities -> PushWard
+  API key on the Settings tab; Live Activities on the Activities tab.
 
   Notifications use an integration key with the 'notifications'
   capability. Live Activities (parity, appdata backup, mover) need

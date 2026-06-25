@@ -4,12 +4,14 @@
 set -euo pipefail
 SRC="$(cd "$(dirname "$0")/src" && pwd)"
 OUT="${1:-$(dirname "$0")/pushward-unraid.plg}"
-VERSION="2026.06.25b"
+VERSION="2026.06.25c"
 
-# Guard: a literal ]]> in any embedded file would break its CDATA section.
-if grep -rlF ']]>' "$SRC" >/dev/null 2>&1; then
+# Guard: a literal ]]> in any embedded TEXT file would break its CDATA section.
+# Skip *.png: the icon is base64-encoded (icon_file), never embedded raw, so a
+# stray ]]> byte in the binary is harmless and must not fail the build.
+if grep -rlF ']]>' "$SRC" --exclude='*.png' >/dev/null 2>&1; then
   echo "ERROR: a src file contains ]]> which breaks CDATA" >&2
-  grep -rlF ']]>' "$SRC" >&2
+  grep -rlF ']]>' "$SRC" --exclude='*.png' >&2
   exit 1
 fi
 
@@ -19,10 +21,35 @@ run_file() {  # comment, srcfile  -> a <FILE Run="/bin/bash"> block
   printf ']]>\n</INLINE>\n</FILE>\n\n'
 }
 
+# md5 of trim(content)+"\n": Unraid writes a <FILE Name> INLINE payload as
+# trim($INLINE).PHP_EOL and stores it on disk, then on a later install REPLACES the
+# file only if the block carries an <MD5>/<SHA256> that differs from what's there.
+# Without a hash it skips any file that already exists, so upgrades never update it.
+# PHP trim() strips [ \t\n\r\0\x0B]; replicate that, append one \n, then md5.
+md5_inline() {  # srcfile (absolute) -> 32-char lowercase md5 hex
+  perl -0777 -pe 's/\A[ \t\n\r\x00\x0B]+//; s/[ \t\n\r\x00\x0B]+\z//' "$1" \
+    | { cat; printf '\n'; } | openssl dgst -md5 | sed 's/^.*= //'
+}
+
 named_file() {  # comment, dest, mode, srcfile -> a <FILE Name=...> block
+  # <MD5> sits AFTER </INLINE> on purpose: Unraid reads it position-independently,
+  # but the CI extractor regex expects <INLINE> right after the open tag, so the
+  # hash must stay outside the INLINE/CDATA it scans.
   printf '<!-- %s -->\n<FILE Name="%s" Mode="%s">\n<INLINE>\n<![CDATA[' "$1" "$2" "$3"
   cat "$SRC/$4"
-  printf ']]>\n</INLINE>\n</FILE>\n\n'
+  printf ']]>\n</INLINE>\n<MD5>%s</MD5>\n</FILE>\n\n' "$(md5_inline "$SRC/$4")"
+}
+
+icon_file() {  # comment, dest, srcpng -> a <FILE Run> that base64-decodes a binary
+  # Binaries can't live in CDATA (PNG bytes aren't valid XML text), so ship the
+  # icon as base64 and decode it on install. Strip newlines so the output is
+  # identical on macOS (build host) and Linux (CI), which differ in base64 line
+  # wrapping; the CI drift check rebuilds from src/ and compares byte-for-byte.
+  printf '<!-- %s -->\n<FILE Run="/bin/bash">\n<INLINE>\n<![CDATA[\n' "$1"
+  printf 'mkdir -p "%s"\n' "$(dirname "$2")"
+  printf 'base64 -d > "%s" <<'\''PWICONB64'\''\n' "$2"
+  base64 < "$SRC/$3" | tr -d '\n'; printf '\n'
+  printf 'PWICONB64\nchmod 0644 "%s"\n]]>\n</INLINE>\n</FILE>\n\n' "$2"
 }
 
 {
@@ -48,6 +75,11 @@ cat <<XMLHEAD
 
 <CHANGES>
 ###$VERSION
+- Move PushWard to the User Utilities row in Settings
+- Merge the Settings and Activities pages into one entry with two tabs
+- Use the PushWard icon instead of the generic bell
+- Replace changed plugin files on upgrade (previously only new files were added)
+###2026.06.25b
 - Add Live Activities: a background monitor pushes parity check / rebuild /
   clear (generic), appdata backup (log) and mover progress to your phone
 - New "PushWard Activities" page to view current Live Activities and end them
@@ -65,8 +97,8 @@ PushWard Unraid Plugin
 Forwards Unraid notifications to PushWard (https://pushward.app) as a native
 dynamix notification agent, and drives PushWard Live Activities for long-running
 operations (parity check/rebuild, appdata backup, mover) via a small background
-monitor. Configure your API key at Settings -> PushWard; view Live Activities at
-Settings -> PushWard Activities.
+monitor. Find it under Settings -> User Utilities -> PushWard: configure your API
+key on the Settings tab and view Live Activities on the Activities tab.
 
 Plugin: https://github.com/mac-lucky/pushward-unraid-plugin
 -->
@@ -82,8 +114,10 @@ named_file "6. Dashboard server-side proxy (keeps the key off the browser)." "/u
 named_file "7. Test Live Activity helper (Settings page button)." "/usr/local/emhttp/plugins/pushward-unraid/test-activity.sh" "0755" test-activity.sh
 named_file "8. Array event: start the monitor when disks mount." "/usr/local/emhttp/plugins/pushward-unraid/event/disks_mounted" "0755" event-disks_mounted.sh
 named_file "9. Array event: stop monitor and end activities when unmounting." "/usr/local/emhttp/plugins/pushward-unraid/event/unmounting_disks" "0755" event-unmounting_disks.sh
-named_file "10. Settings page (Settings -> PushWard)." "/usr/local/emhttp/plugins/pushward-unraid/pushward-unraid.page" "0644" pushward-unraid.page
-named_file "11. Activities dashboard page (Settings -> PushWard Activities)." "/usr/local/emhttp/plugins/pushward-unraid/pushward-activities.page" "0644" pushward-activities.page
+named_file "10. Tab container (Settings -> User Utilities -> PushWard)." "/usr/local/emhttp/plugins/pushward-unraid/pushward-unraid.page" "0644" pushward-unraid.page
+named_file "10a. Settings tab page." "/usr/local/emhttp/plugins/pushward-unraid/pushward-settings.page" "0644" pushward-settings.page
+named_file "11. Activities tab page (live dashboard)." "/usr/local/emhttp/plugins/pushward-unraid/pushward-activities.page" "0644" pushward-activities.page
+icon_file  "11a. Plugin icon (PushWard mark), base64-decoded on install." "/usr/local/emhttp/plugins/pushward-unraid/pushward.png" pushward.png
 named_file "12. Watchdog cron." "/boot/config/plugins/pushward-unraid/pushward-unraid.cron" "0644" pushward-unraid.cron
 run_file   "13. Post-install: register cron, start monitor, print summary." post-install.sh
 

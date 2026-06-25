@@ -55,7 +55,7 @@ jobs:
             echo "== php -l $f =="
             php -l "/tmp/plg/$f"
           done
-          for p in pushward-unraid.page pushward-activities.page; do
+          for p in pushward-settings.page pushward-activities.page; do
             echo "== php -l $p (body) =="
             awk 'f{print} /^---$/{f=1}' "/tmp/plg/$p" > "/tmp/plg/$p.body.php"
             php -l "/tmp/plg/$p.body.php"

@@ -3,7 +3,7 @@
 <!DOCTYPE PLUGIN [
 <!ENTITY name      "pushward-unraid">
 <!ENTITY author    "mac-lucky">
-<!ENTITY version   "2026.06.25b">
+<!ENTITY version   "2026.06.25c">
 <!ENTITY gitURL    "https://github.com/mac-lucky/pushward-unraid-plugin">
 <!ENTITY pluginURL "&gitURL;/raw/main/pushward-unraid.plg">
 <!ENTITY supportURL "&gitURL;/issues">
@@ -18,6 +18,11 @@
         min="6.12">
 
 <CHANGES>
+###2026.06.25c
+- Move PushWard to the User Utilities row in Settings
+- Merge the Settings and Activities pages into one entry with two tabs
+- Use the PushWard icon instead of the generic bell
+- Replace changed plugin files on upgrade (previously only new files were added)
 ###2026.06.25b
 - Add Live Activities: a background monitor pushes parity check / rebuild /
   clear (generic), appdata backup (log) and mover progress to your phone
@@ -36,8 +41,8 @@ PushWard Unraid Plugin
 Forwards Unraid notifications to PushWard (https://pushward.app) as a native
 dynamix notification agent, and drives PushWard Live Activities for long-running
 operations (parity check/rebuild, appdata backup, mover) via a small background
-monitor. Configure your API key at Settings -> PushWard; view Live Activities at
-Settings -> PushWard Activities.
+monitor. Find it under Settings -> User Utilities -> PushWard: configure your API
+key on the Settings tab and view Live Activities on the Activities tab.
 
 Plugin: https://github.com/mac-lucky/pushward-unraid-plugin
 -->
@@ -167,6 +172,7 @@ fi
 exit 0
 ]]>
 </INLINE>
+<MD5>997b0841f78a61b1e13615686c259549</MD5>
 </FILE>
 
 <!-- 3. Test-notification helper (Settings page button). -->
@@ -191,6 +197,7 @@ bash "$AGENT"
 echo "Test notification sent to PushWard. Check your device."
 ]]>
 </INLINE>
+<MD5>ae6d553aed3ccfc9012957d2f3f8b2f2</MD5>
 </FILE>
 
 <!-- 4. Live Activity monitor daemon. -->
@@ -963,6 +970,7 @@ switch ($mode) {
 }
 ]]>
 </INLINE>
+<MD5>3e294cab1d9460884169fc463a2fa669</MD5>
 </FILE>
 
 <!-- 5. Monitor watchdog (cron + array events start it). -->
@@ -1003,6 +1011,7 @@ setsid php "$MON" daemon >/dev/null 2>&1 &
 exit 0
 ]]>
 </INLINE>
+<MD5>1ad1bf79a382c16857a675c68dd255a3</MD5>
 </FILE>
 
 <!-- 6. Dashboard server-side proxy (keeps the key off the browser). -->
@@ -1162,6 +1171,7 @@ switch ($action) {
 }
 ]]>
 </INLINE>
+<MD5>d6e0cfde158a8c13eef6e47c38184bb2</MD5>
 </FILE>
 
 <!-- 7. Test Live Activity helper (Settings page button). -->
@@ -1178,6 +1188,7 @@ fi
 php "$MON" test-activity
 ]]>
 </INLINE>
+<MD5>3fb0e4f776d47216b089e41141e2d9c5</MD5>
 </FILE>
 
 <!-- 8. Array event: start the monitor when disks mount. -->
@@ -1189,6 +1200,7 @@ php "$MON" test-activity
 exit 0
 ]]>
 </INLINE>
+<MD5>33ff208e3f557fc808da826a8d59057d</MD5>
 </FILE>
 
 <!-- 9. Array event: stop monitor and end activities when unmounting. -->
@@ -1216,14 +1228,27 @@ php /usr/local/emhttp/plugins/pushward-unraid/pushward-monitor.php end-all >/dev
 exit 0
 ]]>
 </INLINE>
+<MD5>2ede732c1938ea7e4ec49914e10dced4</MD5>
 </FILE>
 
-<!-- 10. Settings page (Settings -> PushWard). -->
+<!-- 10. Tab container (Settings -> User Utilities -> PushWard). -->
 <FILE Name="/usr/local/emhttp/plugins/pushward-unraid/pushward-unraid.page" Mode="0644">
 <INLINE>
-<![CDATA[Menu="OtherSettings"
+<![CDATA[Menu="Utilities"
+Type="xmenu"
 Title="PushWard"
-Icon="bell"
+Icon="pushward.png"
+Tabs="true"
+]]>
+</INLINE>
+<MD5>e7ad9a6ada1383d8ba963f3a4e194cfd</MD5>
+</FILE>
+
+<!-- 10a. Settings tab page. -->
+<FILE Name="/usr/local/emhttp/plugins/pushward-unraid/pushward-settings.page" Mode="0644">
+<INLINE>
+<![CDATA[Menu="pushward-unraid:1"
+Title="Settings"
 Tag="bell"
 ---
 <?PHP
@@ -1356,8 +1381,7 @@ function pwKeepKey() {
 > Notifications: Unraid calls the agent for any importance with the **Agent**
 > method enabled under Settings &rarr; Notifications (Warning and Alert by
 > default). Live Activities: a background monitor watches parity checks, appdata
-> backups and the mover and pushes progress to your phone. View them under
-> Settings &rarr; **PushWard Activities**.
+> backups and the mover and pushes progress to your phone. See the **Activities** tab.
 
 <?PHP if ($configured && $logTail): ?>
 
@@ -1367,13 +1391,14 @@ Monitor log (last lines):
 <?PHP endif; ?>
 ]]>
 </INLINE>
+<MD5>6c3d05692bc5fd889d55f7f3237e1d53</MD5>
 </FILE>
 
-<!-- 11. Activities dashboard page (Settings -> PushWard Activities). -->
+<!-- 11. Activities tab page (live dashboard). -->
 <FILE Name="/usr/local/emhttp/plugins/pushward-unraid/pushward-activities.page" Mode="0644">
 <INLINE>
-<![CDATA[Menu="OtherSettings"
-Title="PushWard Activities"
+<![CDATA[Menu="pushward-unraid:2"
+Title="Activities"
 Icon="bell"
 Tag="bell"
 ---
@@ -1414,7 +1439,7 @@ if (preg_match('/^csrf_token="?([^"\n]*)"?/m', (string) @file_get_contents('/var
 
 <div class="pw-wrap">
 <?PHP if (!$configured): ?>
-<p class="pw-warn">No API key configured. Set one under <a href="/Settings/pushward-unraid">Settings &rarr; PushWard</a> first.</p>
+<p class="pw-warn">No API key configured. Set one on <a href="/Settings/pushward-settings">the Settings tab</a> first.</p>
 <?PHP else: ?>
 <div id="pw-activities"><p class="pw-empty">Loading current Live Activities&hellip;</p></div>
 <div id="pw-msg" class="pw-warn" role="alert"></div>
@@ -1539,7 +1564,7 @@ if (preg_match('/^csrf_token="?([^"\n]*)"?/m', (string) @file_get_contents('/var
           // outage. Show the error instead.
           if (!r.ok) {
             box.innerHTML = '<p class="pw-warn">PushWard API error: ' + esc(errText(d, r.status)) +
-              '. Check the key and server URL in Settings &rarr; PushWard.</p>';
+              '. Check the key and server URL on the Settings tab.</p>';
             if (upd) upd.textContent = 'error ' + new Date().toLocaleTimeString();
             return;
           }
@@ -1549,7 +1574,7 @@ if (preg_match('/^csrf_token="?([^"\n]*)"?/m', (string) @file_get_contents('/var
         });
       })
       .catch(function () {
-        box.innerHTML = '<p class="pw-warn">Could not reach the PushWard API. Check the key and server URL in Settings &rarr; PushWard.</p>';
+        box.innerHTML = '<p class="pw-warn">Could not reach the PushWard API. Check the key and server URL on the Settings tab.</p>';
       });
   }
 
@@ -1558,6 +1583,20 @@ if (preg_match('/^csrf_token="?([^"\n]*)"?/m', (string) @file_get_contents('/var
 })();
 </script>
 <?PHP endif; ?>
+]]>
+</INLINE>
+<MD5>543a4364f0868266e758ba74966a2a3f</MD5>
+</FILE>
+
+<!-- 11a. Plugin icon (PushWard mark), base64-decoded on install. -->
+<FILE Run="/bin/bash">
+<INLINE>
+<![CDATA[
+mkdir -p "/usr/local/emhttp/plugins/pushward-unraid"
+base64 -d > "/usr/local/emhttp/plugins/pushward-unraid/pushward.png" <<'PWICONB64'
+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
+PWICONB64
+chmod 0644 "/usr/local/emhttp/plugins/pushward-unraid/pushward.png"
 ]]>
 </INLINE>
 </FILE>
@@ -1569,6 +1608,7 @@ if (preg_match('/^csrf_token="?([^"\n]*)"?/m', (string) @file_get_contents('/var
 * * * * * /usr/local/emhttp/plugins/pushward-unraid/watchdog.sh >/dev/null 2>&1
 ]]>
 </INLINE>
+<MD5>62dc532fde1e2076ec04d88047c0fe93</MD5>
 </FILE>
 
 <!-- 13. Post-install: register cron, start monitor, print summary. -->
@@ -1596,8 +1636,8 @@ cat <<EOF
 ================================================================
   PushWard Unraid plugin installed.
 
-  Configure your API key at:  Settings -> PushWard
-  Live Activities dashboard:  Settings -> PushWard Activities
+  Find it under:  Settings -> User Utilities -> PushWard
+  API key on the Settings tab; Live Activities on the Activities tab.
 
   Notifications use an integration key with the 'notifications'
   capability. Live Activities (parity, appdata backup, mover) need

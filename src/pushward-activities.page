@@ -1,5 +1,5 @@
-Menu="OtherSettings"
-Title="PushWard Activities"
+Menu="pushward-unraid:2"
+Title="Activities"
 Icon="bell"
 Tag="bell"
 ---
@@ -40,7 +40,7 @@ if (preg_match('/^csrf_token="?([^"\n]*)"?/m', (string) @file_get_contents('/var
 
 <div class="pw-wrap">
 <?PHP if (!$configured): ?>
-<p class="pw-warn">No API key configured. Set one under <a href="/Settings/pushward-unraid">Settings &rarr; PushWard</a> first.</p>
+<p class="pw-warn">No API key configured. Set one on <a href="/Settings/pushward-settings">the Settings tab</a> first.</p>
 <?PHP else: ?>
 <div id="pw-activities"><p class="pw-empty">Loading current Live Activities&hellip;</p></div>
 <div id="pw-msg" class="pw-warn" role="alert"></div>
@@ -165,7 +165,7 @@ if (preg_match('/^csrf_token="?([^"\n]*)"?/m', (string) @file_get_contents('/var
           // outage. Show the error instead.
           if (!r.ok) {
             box.innerHTML = '<p class="pw-warn">PushWard API error: ' + esc(errText(d, r.status)) +
-              '. Check the key and server URL in Settings &rarr; PushWard.</p>';
+              '. Check the key and server URL on the Settings tab.</p>';
             if (upd) upd.textContent = 'error ' + new Date().toLocaleTimeString();
             return;
           }
@@ -175,7 +175,7 @@ if (preg_match('/^csrf_token="?([^"\n]*)"?/m', (string) @file_get_contents('/var
         });
       })
       .catch(function () {
-        box.innerHTML = '<p class="pw-warn">Could not reach the PushWard API. Check the key and server URL in Settings &rarr; PushWard.</p>';
+        box.innerHTML = '<p class="pw-warn">Could not reach the PushWard API. Check the key and server URL on the Settings tab.</p>';
       });
   }
 

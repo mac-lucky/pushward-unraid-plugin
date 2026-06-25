@@ -22,7 +22,7 @@ Needs Unraid 6.12 or later.
 
 ## Configure
 
-Open Settings > PushWard and fill in:
+Open Settings > PushWard (in the User Utilities row) and, on the Settings tab, fill in:
 
 | Field | What it is |
 |---|---|
@@ -34,7 +34,7 @@ Open Settings > PushWard and fill in:
 | Poll interval | How often the monitor checks state (default 15s) |
 | Activity priority | 0-10, used when PushWard evicts to make room for higher-priority activities |
 
-Click Apply, then use the test buttons to confirm each path. The Settings page shows live status: whether the key is valid, whether the subscription is active, and whether the monitor is running.
+Click Apply, then use the test buttons to confirm each path. The Settings tab shows live status: whether the key is valid, whether the subscription is active, and whether the monitor is running.
 
 ### API key permissions
 
@@ -61,7 +61,7 @@ A background monitor, started by an array-event hook and kept alive by a 1-minut
 | Appdata backup | `appdata.backup` log + state file | log | live log lines + container progress |
 | Mover | `var.ini` mover flag | generic | running / finished (no percentage exists) |
 
-Activities appear via push-to-start (no app interaction needed), update as the job runs, and end automatically when it finishes. View and end the current ones under Settings > PushWard Activities.
+Activities appear via push-to-start (no app interaction needed), update as the job runs, and end automatically when it finishes. View and end the current ones on the Activities tab of Settings > PushWard.
 
 The monitor only reads status; it never touches Unraid or the `appdata.backup` plugin. It also stays under PushWard's update quota by pushing only on a meaningful change.
 
