@@ -1,0 +1,54 @@
+name: Validate plugin
+
+on:
+  push:
+    branches: [main]
+    paths: ['pushward-unraid.plg', '.github/workflows/validate-plg.yml']
+  pull_request:
+    paths: ['pushward-unraid.plg', '.github/workflows/validate-plg.yml']
+  workflow_dispatch:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install validators
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends libxml2-utils shellcheck php-cli >/dev/null
+
+      - name: Validate XML
+        run: xmllint --noout pushward-unraid.plg
+
+      - name: Extract, shellcheck and php-lint the embedded scripts
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/plg
+          # Extract every <FILE Name="..."> CDATA payload into /tmp/plg/<basename>.
+          python3 - <<'PY'
+          import re
+          plg = open('pushward-unraid.plg').read()
+          for name, body in re.findall(r'Name="([^"]+)"[^>]*>\s*<INLINE>\s*<!\[CDATA\[(.*?)\]\]>', plg, re.S):
+              base = name.rsplit('/', 1)[-1]
+              open('/tmp/plg/' + base, 'w').write(body)
+              print('extracted', base)
+          PY
+
+          # Bash scripts: syntax + shellcheck.
+          for f in PushWard test.sh watchdog.sh test-activity.sh disks_mounted unmounting_disks; do
+            echo "== shellcheck $f =="
+            bash -n "/tmp/plg/$f"
+            shellcheck -s bash "/tmp/plg/$f"
+          done
+
+          # PHP files: lint. The .page files have a "header\n---\nbody" layout;
+          # strip the header so only the PHP/HTML body is linted.
+          for f in pushward-monitor.php pwapi.php; do
+            echo "== php -l $f =="
+            php -l "/tmp/plg/$f"
+          done
+          for p in pushward-unraid.page pushward-activities.page; do
+            echo "== php -l $p (body) =="
+            awk 'f{print} /^---$/{f=1}' "/tmp/plg/$p" > "/tmp/plg/$p.body.php"
+            php -l "/tmp/plg/$p.body.php"
+          done

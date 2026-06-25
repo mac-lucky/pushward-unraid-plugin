@@ -1,0 +1,1641 @@
+<?xml version='1.0' standalone='yes'?>
+
+<!DOCTYPE PLUGIN [
+<!ENTITY name      "pushward-unraid">
+<!ENTITY author    "mac-lucky">
+<!ENTITY version   "2026.06.25b">
+<!ENTITY gitURL    "https://github.com/mac-lucky/pushward-unraid-plugin">
+<!ENTITY pluginURL "&gitURL;/raw/main/pushward-unraid.plg">
+<!ENTITY supportURL "&gitURL;/issues">
+]>
+
+<PLUGIN name="&name;"
+        author="&author;"
+        version="&version;"
+        pluginURL="&pluginURL;"
+        support="&supportURL;"
+        icon="bell"
+        min="6.12">
+
+<CHANGES>
+###2026.06.25b
+- Add Live Activities: a background monitor pushes parity check / rebuild /
+  clear (generic), appdata backup (log) and mover progress to your phone
+- New "PushWard Activities" page to view current Live Activities and end them
+- Settings: per-source toggles, poll interval, priority and live key/sub status
+###2026.06.25
+- Standalone rewrite as a native Unraid notification agent
+- No daemon, no downloaded binary, no Unraid API key required
+- Forwards every Unraid notification (including the full -m message body) to PushWard
+- Settings -&gt; PushWard: configure server URL, API key and display name, send a test
+</CHANGES>
+
+<!--
+PushWard Unraid Plugin
+
+Forwards Unraid notifications to PushWard (https://pushward.app) as a native
+dynamix notification agent, and drives PushWard Live Activities for long-running
+operations (parity check/rebuild, appdata backup, mover) via a small background
+monitor. Configure your API key at Settings -> PushWard; view Live Activities at
+Settings -> PushWard Activities.
+
+Plugin: https://github.com/mac-lucky/pushward-unraid-plugin
+-->
+
+<!-- 1. Seed/migrate persistent config (preserves existing values on upgrade). -->
+<FILE Run="/bin/bash">
+<INLINE>
+<![CDATA[
+set -e
+CFG_DIR="/boot/config/plugins/pushward-unraid"
+CFG_FILE="$CFG_DIR/pushward-unraid.cfg"
+mkdir -p "$CFG_DIR"
+mkdir -p /usr/local/emhttp/plugins/pushward-unraid/event
+touch "$CFG_FILE"
+
+# Idempotently ensure every config key exists; existing values are preserved so
+# upgrades pick up the new Live Activity keys without clobbering the API key.
+ensure() { grep -q "^$1=" "$CFG_FILE" || printf '%s=%s\n' "$1" "$2" >> "$CFG_FILE"; }
+ensure PUSHWARD_URL '"https://api.pushward.app"'
+ensure PUSHWARD_API_KEY '""'
+ensure PUSHWARD_SERVER_NAME '"Unraid"'
+ensure PUSHWARD_ACTIVITIES_ENABLED '"true"'
+ensure PUSHWARD_TRACK_PARITY '"true"'
+ensure PUSHWARD_TRACK_BACKUP '"true"'
+ensure PUSHWARD_TRACK_MOVER '"true"'
+ensure PUSHWARD_POLL_INTERVAL '"15"'
+ensure PUSHWARD_ACTIVITY_PRIORITY '"5"'
+chmod 600 "$CFG_FILE"
+echo "PushWard config ready at $CFG_FILE"
+]]>
+</INLINE>
+</FILE>
+
+<!-- 2. PushWard notification agent (dynamix invokes per notification). -->
+<FILE Name="/boot/config/plugins/dynamix/notifications/agents/PushWard" Mode="0755">
+<INLINE>
+<![CDATA[#!/bin/bash
+# PushWard notification agent for Unraid.
+#
+# Invoked by the dynamix notification system with the notification in the
+# environment: EVENT, SUBJECT, DESCRIPTION, IMPORTANCE, CONTENT, LINK,
+# TIMESTAMP. Posts them to the PushWard notification API. No daemon, no Unraid
+# API key. Config: /boot/config/plugins/pushward-unraid/pushward-unraid.cfg
+
+CFG="/boot/config/plugins/pushward-unraid/pushward-unraid.cfg"
+[ -f "$CFG" ] || exit 0
+
+# Read the config by parsing, NOT by sourcing it: the values are operator-entered
+# free text (server name, URL), and `. "$CFG"` would execute any $(...)/backtick
+# in them on every notification. grep+cut never evaluates the value.
+pw_cfg() {  # $1 = key -> value with surrounding quotes stripped
+  local v
+  v="$(grep -E "^$1=" "$CFG" 2>/dev/null | tail -n1 | cut -d= -f2-)"
+  v="${v%\"}"; v="${v#\"}"
+  printf '%s' "$v"
+}
+PUSHWARD_API_KEY="$(pw_cfg PUSHWARD_API_KEY)"
+PUSHWARD_URL="$(pw_cfg PUSHWARD_URL)"
+PUSHWARD_SERVER_NAME="$(pw_cfg PUSHWARD_SERVER_NAME)"
+
+# Nothing to send without an API key; exit cleanly so the notification pipeline
+# isn't disrupted.
+[ -n "${PUSHWARD_API_KEY:-}" ] || exit 0
+
+URL="${PUSHWARD_URL:-https://api.pushward.app}"
+SERVER_NAME="${PUSHWARD_SERVER_NAME:-Unraid}"
+
+# Map Unraid importance (alert/warning/normal) to a PushWard interruption level.
+case "$(printf '%s' "${IMPORTANCE:-}" | tr '[:upper:]' '[:lower:]')" in
+  alert | warning) LEVEL="active" ;;
+  *) LEVEL="passive" ;;
+esac
+
+# Build the JSON with PHP (always present on Unraid) so titles/bodies with
+# quotes, newlines or unicode are escaped correctly. The $-vars below are PHP,
+# not shell, so single quotes are intentional.
+# shellcheck disable=SC2016
+payload="$(SERVER_NAME="$SERVER_NAME" LEVEL="$LEVEL" php -r '
+  $title = getenv("SUBJECT");
+  if ($title === false || $title === "") $title = getenv("EVENT");
+  if ($title === false || $title === "") $title = "Unraid notification";
+  $body = getenv("CONTENT");
+  if ($body === false || $body === "") $body = getenv("DESCRIPTION");
+  if ($body === false || $body === "") $body = $title;
+  $meta = array_filter([
+    "importance" => getenv("IMPORTANCE") ?: "",
+    "event"      => getenv("EVENT") ?: "",
+    "server"     => getenv("SERVER_NAME") ?: "",
+    "timestamp"  => getenv("TIMESTAMP") ?: "",
+  ], fn($v) => $v !== "");
+  // SUBSTITUTE so a non-UTF-8 byte in a SMART/device string (common in Unraid
+  // alerts) can not make json_encode() return false and post an empty body.
+  $json = json_encode([
+    "title"               => $title,
+    "subtitle"            => "Unraid · " . getenv("SERVER_NAME"),
+    "body"                => $body,
+    "level"               => getenv("LEVEL"),
+    "push"                => true,
+    "source"              => "unraid",
+    "source_display_name" => "Unraid",
+    "thread_id"           => "unraid",
+    "url"                 => getenv("LINK") ?: "",
+    "metadata"            => (object) $meta,
+  ], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_INVALID_UTF8_SUBSTITUTE);
+  if ($json === false) { fwrite(STDERR, json_last_error_msg()); exit(1); }
+  echo $json;
+')"
+
+# Never POST an empty body (the server would 4xx and the alert would vanish).
+if [ -z "$payload" ]; then
+  logger -t pushward "notification payload could not be built; alert NOT sent (subject: ${SUBJECT:-?})"
+  exit 0
+fi
+
+# Surface delivery failures to the system log instead of swallowing them, so a
+# dropped alert (bad key, missing capability, 4xx/5xx, network) is diagnosable.
+# Still exit 0 so the dynamix notification pipeline isn't disrupted.
+curl -fsS -m 15 -X POST "$URL/notifications" \
+  -H "Authorization: Bearer $PUSHWARD_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d "$payload" >/dev/null 2>&1
+rc=$?
+if [ "$rc" -ne 0 ]; then
+  logger -t pushward "notification delivery to PushWard failed (curl exit $rc; subject: ${SUBJECT:-?})"
+fi
+
+exit 0
+]]>
+</INLINE>
+</FILE>
+
+<!-- 3. Test-notification helper (Settings page button). -->
+<FILE Name="/usr/local/emhttp/plugins/pushward-unraid/test.sh" Mode="0755">
+<INLINE>
+<![CDATA[#!/bin/bash
+# Fire a sample notification straight through the PushWard agent so the user can
+# verify their config without waiting for a real Unraid event.
+AGENT="/boot/config/plugins/dynamix/notifications/agents/PushWard"
+if [ ! -f "$AGENT" ]; then
+  echo "PushWard agent not installed at $AGENT" >&2
+  exit 1
+fi
+EVENT="Test" \
+SUBJECT="PushWard test notification" \
+DESCRIPTION="Test from Settings -> PushWard" \
+CONTENT="If this reached your device, the PushWard agent is working." \
+IMPORTANCE="alert" \
+LINK="https://pushward.app" \
+TIMESTAMP="$(date +%s)" \
+bash "$AGENT"
+echo "Test notification sent to PushWard. Check your device."
+]]>
+</INLINE>
+</FILE>
+
+<!-- 4. Live Activity monitor daemon. -->
+<FILE Name="/usr/local/emhttp/plugins/pushward-unraid/pushward-monitor.php" Mode="0755">
+<INLINE>
+<![CDATA[#!/usr/bin/php
+<?php
+/**
+ * PushWard Unraid monitor daemon.
+ *
+ * Polls Unraid for long-running operations and drives PushWard Live Activities
+ * over the public REST API:
+ *   - parity check / rebuild / clear  -> "generic" template (progress + ETA)
+ *   - appdata backup (CA appdata.backup) -> "log" template (streaming log lines)
+ *   - mover (cache -> array)          -> "generic" template (indeterminate)
+ *
+ * Single long-running process, supervised by watchdog.sh (flock + pgrep) and a
+ * 1-minute cron, started/stopped by the array event hooks. No external deps
+ * beyond php-cli + curl, both always present on Unraid.
+ *
+ * Usage:
+ *   php pushward-monitor.php             # run the daemon loop
+ *   php pushward-monitor.php end-all     # end every active activity, clear state
+ *   php pushward-monitor.php test-activity  # push a short demo activity
+ */
+
+const CFG_FILE   = '/boot/config/plugins/pushward-unraid/pushward-unraid.cfg';
+const STATE_DIR  = '/var/run/pushward';
+const STATE_FILE = '/var/run/pushward/state.json';
+const LOCK_FILE  = '/var/run/pushward/monitor.lock';
+const LOG_FILE   = '/var/log/pushward-monitor.log';
+const LOG_MAX    = 262144; // 256 KiB before truncation
+const BACKUP_TMP = '/tmp/appdata.backup';
+const VAR_INI    = '/var/local/emhttp/var.ini';
+
+const PROGRESS_EPSILON = 0.01; // re-push when progress moves >= 1%
+const HEARTBEAT_SECS   = 30;   // re-push at least this often while active (keeps ETA fresh)
+const START_RETRY_SECS = 60;   // back off this long after a failed create
+
+// ---------------------------------------------------------------------------
+// Config
+// ---------------------------------------------------------------------------
+
+function load_cfg(): array {
+    $cfg = @parse_ini_file(CFG_FILE) ?: [];
+    $bool = fn($k, $d) => (($cfg[$k] ?? ($d ? 'true' : 'false')) !== 'false');
+    return [
+        // false when the file failed to parse / was read mid-write (empty array);
+        // a real config always carries several seeded keys.
+        'valid'    => !empty($cfg),
+        'url'      => rtrim($cfg['PUSHWARD_URL'] ?? 'https://api.pushward.app', '/'),
+        'key'      => trim($cfg['PUSHWARD_API_KEY'] ?? ''),
+        'server'   => trim($cfg['PUSHWARD_SERVER_NAME'] ?? 'Unraid'),
+        'enabled'  => $bool('PUSHWARD_ACTIVITIES_ENABLED', true),
+        'parity'   => $bool('PUSHWARD_TRACK_PARITY', true),
+        'backup'   => $bool('PUSHWARD_TRACK_BACKUP', true),
+        'mover'    => $bool('PUSHWARD_TRACK_MOVER', true),
+        'interval' => max(5, (int) ($cfg['PUSHWARD_POLL_INTERVAL'] ?? 15)),
+        'priority' => max(0, min(10, (int) ($cfg['PUSHWARD_ACTIVITY_PRIORITY'] ?? 5))),
+    ];
+}
+
+function slug_prefix(string $server): string {
+    $p = strtolower($server);
+    $p = preg_replace('/[^a-z0-9]+/', '-', $p);
+    $p = trim((string) $p, '-');
+    return $p !== '' ? $p : 'unraid';
+}
+
+// ---------------------------------------------------------------------------
+// Logging + state
+// ---------------------------------------------------------------------------
+
+function mlog(string $msg, string $level = 'info'): void {
+    if (@filesize(LOG_FILE) > LOG_MAX) {
+        @file_put_contents(LOG_FILE, ''); // simple truncate; this is a tmpfs debug log
+    }
+    @file_put_contents(LOG_FILE, '[' . date('Y-m-d H:i:s') . "][$level] $msg\n", FILE_APPEND);
+}
+
+function load_state(): array {
+    $s = @json_decode((string) @file_get_contents(STATE_FILE), true);
+    return is_array($s) ? $s : [];
+}
+
+function save_state(array $s): void {
+    // Encode first and bail on failure: a stray non-UTF-8 byte in a stashed log
+    // line would otherwise make json_encode() return false, write a 0-byte file
+    // and clobber the good state, losing every tracked slug. SUBSTITUTE keeps
+    // bad bytes from failing the encode in the first place; the false-check is
+    // the real guard.
+    $json = json_encode($s, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_INVALID_UTF8_SUBSTITUTE);
+    if ($json === false) {
+        mlog('save_state: json_encode failed (' . json_last_error_msg() . '); keeping previous state', 'error');
+        return;
+    }
+    // Atomic write so a concurrent reader (a one-shot subcommand) never sees a
+    // truncated file and forgets the active activities.
+    $tmp = STATE_FILE . '.' . getmypid() . '.tmp';
+    if (@file_put_contents($tmp, $json) !== false) {
+        @rename($tmp, STATE_FILE);
+    } else {
+        @unlink($tmp);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PushWard REST client
+// ---------------------------------------------------------------------------
+
+function pw_request(array $cfg, string $method, string $path, ?array $body, string $contentType = 'application/json'): array {
+    $ch = curl_init($cfg['url'] . $path);
+    curl_setopt_array($ch, [
+        CURLOPT_CUSTOMREQUEST  => $method,
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_TIMEOUT        => 20,
+        CURLOPT_CONNECTTIMEOUT => 10,
+        CURLOPT_HTTPHEADER     => [
+            'Authorization: Bearer ' . $cfg['key'],
+            'Content-Type: ' . $contentType,
+            'Accept: application/json',
+        ],
+    ]);
+    if ($body !== null) {
+        // SUBSTITUTE so a non-UTF-8 byte in a backup log line can't make
+        // json_encode() return false and post an empty body (silently dropped).
+        curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($body, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_INVALID_UTF8_SUBSTITUTE));
+    }
+    $resp = curl_exec($ch);
+    $code = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $err  = curl_error($ch);
+    curl_close($ch);
+    return ['code' => $code, 'body' => (string) $resp, 'error' => $err];
+}
+
+function pw_ok(array $r): bool {
+    return $r['code'] >= 200 && $r['code'] < 300;
+}
+
+function pw_create(array $cfg, string $slug, string $name, int $priority, int $endedTtl = 300, int $staleTtl = 1800): array {
+    return pw_request($cfg, 'POST', '/activities', [
+        'slug'      => $slug,
+        'name'      => $name,
+        'priority'  => $priority,
+        'ended_ttl' => $endedTtl,
+        'stale_ttl' => $staleTtl,
+    ]);
+}
+
+function pw_patch(array $cfg, string $slug, array $patch): array {
+    return pw_request($cfg, 'PATCH', '/activities/' . rawurlencode($slug), $patch, 'application/merge-patch+json');
+}
+
+// ---------------------------------------------------------------------------
+// Formatting helpers
+// ---------------------------------------------------------------------------
+
+function human_eta(int $s): string {
+    if ($s <= 0) {
+        return '';
+    }
+    $h = intdiv($s, 3600);
+    $m = intdiv($s % 3600, 60);
+    if ($h > 0) {
+        return "{$h}h{$m}m";
+    }
+    if ($m > 0) {
+        return "{$m}m";
+    }
+    return "{$s}s";
+}
+
+function human_speed(float $kbps): string {
+    if ($kbps <= 0) {
+        return '';
+    }
+    $mbps = $kbps / 1024.0;
+    return $mbps >= 1 ? round($mbps, 1) . ' MB/s' : round($kbps) . ' KB/s';
+}
+
+function map_level(string $raw): string {
+    if (strpos($raw, "\u{274C}") !== false || stripos($raw, 'err') !== false) {
+        return 'error';
+    }
+    if (strpos($raw, "\u{26A0}") !== false || stripos($raw, 'warn') !== false) {
+        return 'warn';
+    }
+    return 'info';
+}
+
+// ---------------------------------------------------------------------------
+// Detection: parity / array operation (mdcmd status)
+// ---------------------------------------------------------------------------
+
+function md_status(): array {
+    $out = [];
+    @exec('/usr/local/sbin/mdcmd status 2>/dev/null', $lines);
+    foreach ($lines as $l) {
+        if (strpos($l, '=') !== false) {
+            [$k, $v] = explode('=', $l, 2);
+            $out[$k] = $v;
+        }
+    }
+    return $out;
+}
+
+function detect_parity(array $md): ?array {
+    // mdResync is 0 when idle, non-zero while a parity op runs.
+    if ((float) ($md['mdResync'] ?? 0) <= 0) {
+        return null;
+    }
+    $pos  = (float) ($md['mdResyncPos'] ?? 0);
+    $size = (float) ($md['mdResyncSize'] ?? 0);
+    $progress = $size > 0 ? min(1.0, max(0.0, $pos / $size)) : 0.0;
+    $action = trim($md['mdResyncAction'] ?? '');
+    $corr   = (int) ($md['mdResyncCorr'] ?? 0);
+
+    $label = 'Array operation';
+    $icon  = 'externaldrive.fill';
+    if (stripos($action, 'check') !== false) {
+        $label = 'Parity-Check';
+        $icon  = 'externaldrive.fill.badge.checkmark';
+    } elseif (stripos($action, 'recon') !== false) {
+        $label = 'Rebuilding parity';
+        $icon  = 'arrow.triangle.2.circlepath';
+    } elseif (stripos($action, 'clear') !== false) {
+        $label = 'Clearing disk';
+        $icon  = 'eraser.fill';
+    }
+    return [
+        'progress' => $progress,
+        'pos'      => $pos,
+        'size'     => $size,
+        'action'   => $action,
+        'label'    => $label,
+        'icon'     => $icon,
+        'corr'     => $corr,
+    ];
+}
+
+// ---------------------------------------------------------------------------
+// Detection: mover (var.ini)
+// ---------------------------------------------------------------------------
+
+function var_ini_val(string $key): ?string {
+    $data = @file_get_contents(VAR_INI);
+    if ($data === false) {
+        return null;
+    }
+    if (preg_match('/^' . preg_quote($key, '/') . '="?([^"\n]*)"?/m', $data, $m)) {
+        return $m[1];
+    }
+    return null;
+}
+
+function detect_mover(): bool {
+    return var_ini_val('shareMoverActive') === 'yes';
+}
+
+// ---------------------------------------------------------------------------
+// Detection: appdata backup (running file + ab.log)
+// ---------------------------------------------------------------------------
+
+function backup_running(): bool {
+    return file_exists(BACKUP_TMP . '/running');
+}
+
+/** Parse a single ab.log line into [tsUnix|null, level, component, message]. */
+function parse_backup_line(string $line): ?array {
+    if (!preg_match('/^\[([^\]]*)\]\[([^\]]*)\]\[([^\]]*)\]\s?(.*)$/u', $line, $m)) {
+        return null;
+    }
+    $ts = DateTime::createFromFormat('d.m.Y H:i:s', trim($m[1]));
+    return [
+        'at'   => $ts ? $ts->getTimestamp() : null,
+        'level' => map_level($m[2]),
+        'comp' => trim($m[3]),
+        'msg'  => trim($m[4]),
+    ];
+}
+
+/**
+ * Whole-file scan of ab.log: overall progress + current container + flags.
+ *
+ * Containers are backed up in the plugin's own order, not the alphabetical
+ * "Selected containers" order, so progress is the count of DISTINCT containers
+ * that have appeared in the log (order-independent and monotonic), and the
+ * current container is simply the most recent one with activity.
+ */
+function backup_progress(string $logPath): array {
+    $content  = (string) @file_get_contents($logPath);
+    $lines    = preg_split('/\r?\n/', $content) ?: [];
+    $total    = 0;
+    $seen     = [];
+    $current  = '';
+    $finished = false;
+    $error    = false;
+    foreach ($lines as $l) {
+        if (preg_match('/\]\[Main\]\s*Selected containers:\s*(.+)$/u', $l, $m)) {
+            $total = count(array_map('trim', explode(',', $m[1])));
+            continue;
+        }
+        $p = parse_backup_line($l);
+        if ($p === null) {
+            continue;
+        }
+        if ($p['comp'] !== 'Main' && $p['comp'] !== '') {
+            $seen[$p['comp']] = true;
+            $current = $p['comp'];
+        }
+        if (strpos($l, 'DONE! Thanks for using') !== false) {
+            $finished = true;
+        }
+        if ($p['level'] === 'error') {
+            $error = true;
+        }
+    }
+    $done = count($seen);
+    return [
+        'total'    => $total ?: $done,
+        // Clamp so a stray non-container component can't render "(8/5)".
+        'idx'      => $total > 0 ? min($done, $total) : $done,
+        'current'  => $current,
+        'progress' => $total > 0 ? min(1.0, $done / $total) : 0.0,
+        'finished' => $finished,
+        'error'    => $error,
+    ];
+}
+
+/** The newest $n log lines as PushWard LogLine objects, newest-first. */
+function backup_log_lines(string $logPath, int $n): array {
+    $content = (string) @file_get_contents($logPath);
+    $raw = array_values(array_filter(
+        preg_split('/\r?\n/', $content) ?: [],
+        fn($l) => trim($l) !== ''
+    ));
+    $tail = array_slice($raw, -$n);
+    $out = [];
+    foreach ($tail as $l) {
+        $p = parse_backup_line($l);
+        if ($p === null) {
+            continue;
+        }
+        $text = ($p['comp'] !== '' && $p['comp'] !== 'Main') ? $p['comp'] . ': ' . $p['msg'] : $p['msg'];
+        $text = mb_substr($text, 0, 512);
+        if ($text === '') {
+            continue;
+        }
+        $line = ['text' => $text, 'level' => $p['level']];
+        if ($p['at'] !== null) {
+            $line['at'] = $p['at'];
+        }
+        $out[] = $line;
+    }
+    return array_reverse($out); // newest-first
+}
+
+/** Size of ab.log, to detect new content cheaply for the throttle. */
+function backup_log_size(string $logPath): int {
+    $s = @filesize($logPath);
+    return $s === false ? 0 : (int) $s;
+}
+
+// ---------------------------------------------------------------------------
+// Activity lifecycle helpers
+// ---------------------------------------------------------------------------
+
+function should_push(array $st, float $progress, string $stateText, bool $newContent, int $now): bool {
+    if (empty($st['last_push_ts'])) {
+        return true;
+    }
+    if ($newContent) {
+        return true;
+    }
+    if ($stateText !== ($st['last_state_text'] ?? '')) {
+        return true;
+    }
+    if (abs($progress - (float) ($st['last_progress'] ?? -1)) >= PROGRESS_EPSILON) {
+        return true;
+    }
+    return ($now - (int) $st['last_push_ts']) >= HEARTBEAT_SECS;
+}
+
+/**
+ * Drive one activity through its lifecycle.
+ *
+ * @param array|null $content  desired content frame while active, or null when idle
+ * @param array      $st       per-slug persisted state (by ref)
+ */
+function drive_activity(array $cfg, string $slug, string $name, ?array $content, float $progress, string $stateText, bool $newContent, array &$st): void {
+    $now = time();
+
+    if ($content !== null) {
+        if (empty($st['active'])) {
+            if (!empty($st['start_fail_ts']) && ($now - (int) $st['start_fail_ts']) < START_RETRY_SECS) {
+                return; // back off after a failed create
+            }
+            $c = pw_create($cfg, $slug, $name, $cfg['priority']);
+            if (!pw_ok($c)) {
+                $st['start_fail_ts'] = $now;
+                mlog("create $slug failed: {$c['code']} {$c['body']} {$c['error']}", 'error');
+                return;
+            }
+            // POST creates the row in the ended state; PATCH to ongoing is what
+            // actually starts it and fires the server push-to-start broadcast.
+            $p = pw_patch($cfg, $slug, ['state' => 'ongoing', 'content' => $content]);
+            if (!pw_ok($p)) {
+                $st['start_fail_ts'] = $now;
+                mlog("seed $slug failed: {$p['code']} {$p['body']}", 'error');
+                return;
+            }
+            // Merge (don't replace) so end_content / log_size / pos bookkeeping
+            // the caller stashed on $st survives the start transition.
+            $st['active']          = true;
+            $st['last_push_ts']    = $now;
+            $st['last_progress']   = $progress;
+            $st['last_state_text'] = $stateText;
+            unset($st['start_fail_ts']);
+            mlog("started $slug ($stateText)");
+            return;
+        }
+        if (should_push($st, $progress, $stateText, $newContent, $now)) {
+            // Re-assert ongoing so the activity auto-recovers if the cap had
+            // preempted it; harmless (no push) when it's already ongoing.
+            $p = pw_patch($cfg, $slug, ['state' => 'ongoing', 'content' => $content]);
+            if (pw_ok($p)) {
+                $st['last_push_ts']    = $now;
+                $st['last_progress']   = $progress;
+                $st['last_state_text'] = $stateText;
+            } else {
+                mlog("update $slug failed: {$p['code']} {$p['body']}", 'error');
+                // The server has fully dropped the row (stale-ended + TTL-evicted
+                // after a long daemon outage). Re-asserting ongoing only works
+                // while the row still exists; once it's a 404 we must re-create,
+                // so clear active and let the next tick POST a fresh activity
+                // instead of 404-looping for the rest of the run.
+                if ($p['code'] === 404) {
+                    $st['active'] = false;
+                }
+            }
+        }
+        return;
+    }
+
+    // idle: if we were tracking it, send the final ENDED frame
+    if (!empty($st['active'])) {
+        $st['active'] = false;
+        $end = $st['end_content'] ?? ['template' => 'generic', 'progress' => 1.0, 'state' => 'Complete'];
+        $p = pw_patch($cfg, $slug, ['state' => 'ended', 'content' => $end]);
+        mlog("ended $slug" . (pw_ok($p) ? '' : " (patch {$p['code']})"));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Per-tick operation handlers
+// ---------------------------------------------------------------------------
+
+function tick_parity(array $cfg, string $prefix, array $md, array &$state): void {
+    $slug = "$prefix-array";
+    $st   = $state[$slug] ?? [];
+    $p    = detect_parity($md);
+
+    if ($p !== null) {
+        $now = time();
+        $eta = 0;
+        if (isset($st['last_pos'], $st['last_pos_ts']) && $now > (int) $st['last_pos_ts']) {
+            $dpos = $p['pos'] - (float) $st['last_pos'];
+            $dt   = $now - (int) $st['last_pos_ts'];
+            if ($dpos > 0) {
+                $speed = $dpos / $dt; // KB/s
+                $eta   = (int) (($p['size'] - $p['pos']) / $speed);
+                $st['last_speed'] = $speed;
+            }
+        }
+        $st['last_pos']    = $p['pos'];
+        $st['last_pos_ts'] = $now;
+        $speed = (float) ($st['last_speed'] ?? 0);
+
+        $pct       = round($p['progress'] * 100);
+        $stateText = sprintf('%s · %d%%', $p['label'], $pct);
+        $subParts  = [];
+        if ($eta > 0) {
+            $subParts[] = 'ETA ' . human_eta($eta);
+        }
+        if ($speed > 0) {
+            $subParts[] = human_speed($speed);
+        }
+        if (stripos($p['action'], 'check') !== false) {
+            $subParts[] = $p['corr'] . ' error' . ($p['corr'] === 1 ? '' : 's');
+        }
+        $content = [
+            'template'     => 'generic',
+            'progress'     => round($p['progress'], 4),
+            'state'        => $stateText,
+            'subtitle'     => implode(' · ', $subParts),
+            'icon'         => $p['icon'],
+            'accent_color' => $p['corr'] > 0 ? 'orange' : 'blue',
+        ];
+        if ($eta > 0) {
+            $content['remaining_time'] = $eta;
+        }
+        $st['end_content'] = [
+            'template'     => 'generic',
+            'progress'     => 1.0,
+            'state'        => $p['label'] . ' complete',
+            'subtitle'     => $p['corr'] > 0 ? $p['corr'] . ' errors found' : 'No errors',
+            'icon'         => $p['corr'] > 0 ? 'exclamationmark.triangle.fill' : 'checkmark.circle.fill',
+            'accent_color' => $p['corr'] > 0 ? 'red' : 'green',
+        ];
+        drive_activity($cfg, $slug, 'Unraid · ' . $cfg['server'] . ' array', $content, $p['progress'], $stateText, false, $st);
+    } else {
+        drive_activity($cfg, $slug, '', null, 1.0, '', false, $st);
+        if (empty($st['active'])) {
+            unset($st['last_pos'], $st['last_pos_ts'], $st['last_speed']);
+        }
+    }
+    $state[$slug] = $st;
+}
+
+function tick_backup(array $cfg, string $prefix, array &$state): void {
+    $slug = "$prefix-backup";
+    $st   = $state[$slug] ?? [];
+    $log  = BACKUP_TMP . '/ab.log';
+
+    if (backup_running()) {
+        $bp   = backup_progress($log);
+        $size = backup_log_size($log);
+        $newContent = $size !== (int) ($st['log_size'] ?? -1);
+        $st['log_size'] = $size;
+
+        $stateText = $bp['current'] !== ''
+            ? sprintf('Backing up %s (%d/%d)', $bp['current'], $bp['idx'], $bp['total'])
+            : 'Starting appdata backup…';
+        $content = [
+            'template'     => 'log',
+            'progress'     => round($bp['progress'], 4),
+            'state'        => $stateText,
+            'icon'         => 'externaldrive.badge.timemachine',
+            'accent_color' => $bp['error'] ? 'orange' : 'blue',
+            'lines'        => backup_log_lines($log, 10),
+        ];
+        $st['end_content'] = [
+            'template'     => 'log',
+            'progress'     => 1.0,
+            'state'        => $bp['error'] ? 'Backup finished with errors' : 'Backup complete',
+            'icon'         => $bp['error'] ? 'exclamationmark.triangle.fill' : 'checkmark.circle.fill',
+            'accent_color' => $bp['error'] ? 'red' : 'green',
+            'lines'        => backup_log_lines($log, 10),
+        ];
+        drive_activity($cfg, $slug, 'Unraid · ' . $cfg['server'] . ' appdata backup', $content, $bp['progress'], $stateText, $newContent, $st);
+    } else {
+        if (!empty($st['active']) && !empty($st['end_content'])) {
+            // refresh the final frame with the last lines of the completed run
+            $st['end_content']['lines'] = backup_log_lines($log, 10);
+        }
+        drive_activity($cfg, $slug, '', null, 1.0, '', false, $st);
+        if (empty($st['active'])) {
+            unset($st['log_size']);
+        }
+    }
+    $state[$slug] = $st;
+}
+
+function tick_mover(array $cfg, string $prefix, array &$state): void {
+    $slug = "$prefix-mover";
+    $st   = $state[$slug] ?? [];
+
+    if (detect_mover()) {
+        $stateText = 'Mover running';
+        $content = [
+            'template'     => 'generic',
+            'state'        => $stateText,
+            'subtitle'     => 'Moving cache → array',
+            'icon'         => 'arrow.down.to.line',
+            'accent_color' => 'blue',
+        ];
+        $st['end_content'] = [
+            'template'     => 'generic',
+            'state'        => 'Mover finished',
+            'icon'         => 'checkmark.circle.fill',
+            'accent_color' => 'green',
+        ];
+        drive_activity($cfg, $slug, 'Unraid · ' . $cfg['server'] . ' mover', $content, 0.0, $stateText, false, $st);
+    } else {
+        drive_activity($cfg, $slug, '', null, 0.0, '', false, $st);
+    }
+    $state[$slug] = $st;
+}
+
+function tick(array $cfg): void {
+    $prefix = slug_prefix($cfg['server']);
+    $state  = load_state();
+    $md     = ($cfg['parity']) ? md_status() : [];
+    if ($cfg['parity']) {
+        tick_parity($cfg, $prefix, $md, $state);
+    }
+    if ($cfg['backup']) {
+        tick_backup($cfg, $prefix, $state);
+    }
+    if ($cfg['mover']) {
+        tick_mover($cfg, $prefix, $state);
+    }
+    save_state($state);
+}
+
+// ---------------------------------------------------------------------------
+// One-shot subcommands
+// ---------------------------------------------------------------------------
+
+function cmd_end_all(array $cfg): void {
+    $state = load_state();
+    foreach ($state as $slug => $st) {
+        if (!empty($st['active'])) {
+            $end = $st['end_content'] ?? ['template' => 'generic', 'state' => 'Ended'];
+            pw_patch($cfg, $slug, ['state' => 'ended', 'content' => $end]);
+            $state[$slug]['active'] = false;
+            mlog("end-all: ended $slug");
+        }
+    }
+    save_state($state);
+}
+
+function cmd_test_activity(array $cfg): void {
+    $slug = slug_prefix($cfg['server']) . '-test';
+    // Short TTLs so a forgotten test card self-cleans on the server within
+    // minutes rather than lingering ~30 min.
+    $c = pw_create($cfg, $slug, 'Unraid · ' . $cfg['server'] . ' test', $cfg['priority'], 120, 600);
+    if (!pw_ok($c)) {
+        fwrite(STDERR, "create failed: {$c['code']} {$c['body']}\n");
+        exit(1);
+    }
+    $p = pw_patch($cfg, $slug, ['state' => 'ongoing', 'content' => [
+        'template'     => 'generic',
+        'progress'     => 0.42,
+        'state'        => 'PushWard test activity',
+        'subtitle'     => 'If you see this on your phone, Live Activities work',
+        'icon'         => 'bell.badge.fill',
+        'accent_color' => 'indigo',
+    ]]);
+    if (!pw_ok($p)) {
+        fwrite(STDERR, "seed failed: {$p['code']} {$p['body']}\n");
+        exit(1);
+    }
+    // Record it in state so end-all (array stop / uninstall) ends it; otherwise
+    // it would survive both and only disappear on the server's stale_ttl.
+    $state = load_state();
+    $state[$slug] = [
+        'active'       => true,
+        'last_push_ts' => time(),
+        'end_content'  => [
+            'template'     => 'generic',
+            'progress'     => 1.0,
+            'state'        => 'Test ended',
+            'icon'         => 'checkmark.circle.fill',
+            'accent_color' => 'green',
+        ],
+    ];
+    save_state($state);
+    echo "Test activity '$slug' pushed. Check your device and the dashboard.\n";
+}
+
+// ---------------------------------------------------------------------------
+// Main
+// ---------------------------------------------------------------------------
+
+function run_daemon(array $cfg): void {
+    @mkdir(STATE_DIR, 0755, true);
+    $lock = fopen(LOCK_FILE, 'c');
+    if (!$lock || !flock($lock, LOCK_EX | LOCK_NB)) {
+        exit(0); // another instance already owns the loop
+    }
+
+    $running = true;
+    if (function_exists('pcntl_async_signals')) {
+        pcntl_async_signals(true);
+        $stop = function () use (&$running) {
+            $running = false;
+        };
+        pcntl_signal(SIGTERM, $stop);
+        pcntl_signal(SIGINT, $stop);
+    }
+
+    mlog('monitor started (interval ' . $cfg['interval'] . 's)');
+    while ($running) {
+        try {
+            tick($cfg);
+        } catch (\Throwable $e) {
+            mlog('tick error: ' . $e->getMessage(), 'error');
+        }
+        $fresh = load_cfg();
+        // Ignore a transient failed read (settings page mid-write); only adopt a
+        // config that actually parsed.
+        if ($fresh['valid']) {
+            // A renamed server changes the slug prefix; end the old-prefix
+            // activities (still in state, still reachable with the current key)
+            // before adopting the new name, so they don't freeze on the phone
+            // while duplicates appear under the new prefix.
+            if (slug_prefix($fresh['server']) !== slug_prefix($cfg['server']) && $cfg['key'] !== '') {
+                mlog('server name changed; ending activities under the old prefix');
+                cmd_end_all($cfg);
+            }
+            $cfg = $fresh;
+        }
+        if (!$cfg['enabled'] || $cfg['key'] === '') {
+            // End in-flight activities on disable so the user isn't left with a
+            // frozen card until stale_ttl. A cleared key can't authenticate, so
+            // only the API is out of reach then, and nothing we can do but exit.
+            if ($cfg['key'] !== '') {
+                mlog('Live Activities disabled; ending active activities and exiting');
+                cmd_end_all($cfg);
+            } else {
+                mlog('API key cleared; exiting (cannot end activities without auth)');
+            }
+            break;
+        }
+        for ($i = 0; $i < $cfg['interval'] && $running; $i++) {
+            sleep(1);
+        }
+    }
+    mlog('monitor stopped');
+}
+
+// ab.log (and Unraid logs) are written in the box's local time, but PHP defaults
+// to UTC, so match the box so parsed LogLine `at` values are correct instants.
+function pushward_local_tz(): string {
+    $link = @readlink('/etc/localtime');
+    if ($link !== false && ($i = strpos($link, 'zoneinfo/')) !== false) {
+        $tz = substr($link, $i + strlen('zoneinfo/'));
+        if (@timezone_open($tz) !== false) {
+            return $tz;
+        }
+    }
+    return @date_default_timezone_get() ?: 'UTC';
+}
+date_default_timezone_set(pushward_local_tz());
+
+// Allow unit tests to require this file for its functions without running main.
+if (defined('PUSHWARD_NO_MAIN')) {
+    return;
+}
+
+$cfg = load_cfg();
+$mode = $argv[1] ?? 'daemon';
+
+if ($cfg['key'] === '') {
+    fwrite(STDERR, "PushWard API key not configured\n");
+    exit(0);
+}
+
+switch ($mode) {
+    case 'end-all':
+        cmd_end_all($cfg);
+        break;
+    case 'test-activity':
+        cmd_test_activity($cfg);
+        break;
+    case 'once':
+        // Run a single poll cycle and exit (testing / cron-fallback).
+        if ($cfg['enabled']) {
+            tick($cfg);
+        }
+        break;
+    case 'daemon':
+    default:
+        if (!$cfg['enabled']) {
+            exit(0);
+        }
+        run_daemon($cfg);
+        break;
+}
+]]>
+</INLINE>
+</FILE>
+
+<!-- 5. Monitor watchdog (cron + array events start it). -->
+<FILE Name="/usr/local/emhttp/plugins/pushward-unraid/watchdog.sh" Mode="0755">
+<INLINE>
+<![CDATA[#!/bin/bash
+# PushWard monitor watchdog. Starts the daemon if it isn't already running.
+# Invoked every minute by cron and by the array event hooks. The daemon itself
+# holds an flock so a double-launch is harmless; pgrep just avoids the churn.
+
+CFG="/boot/config/plugins/pushward-unraid/pushward-unraid.cfg"
+MON="/usr/local/emhttp/plugins/pushward-unraid/pushward-monitor.php"
+
+[ -f "$CFG" ] || exit 0
+
+# Parse the config rather than sourcing it: the values are operator-entered free
+# text and `. "$CFG"` would execute any $(...)/backticks in them every minute via
+# cron. grep+cut never evaluates the value.
+pw_cfg() {  # $1 = key -> value with surrounding quotes stripped
+  local v
+  v="$(grep -E "^$1=" "$CFG" 2>/dev/null | tail -n1 | cut -d= -f2-)"
+  v="${v%\"}"; v="${v#\"}"
+  printf '%s' "$v"
+}
+PUSHWARD_API_KEY="$(pw_cfg PUSHWARD_API_KEY)"
+PUSHWARD_ACTIVITIES_ENABLED="$(pw_cfg PUSHWARD_ACTIVITIES_ENABLED)"
+
+[ -n "${PUSHWARD_API_KEY:-}" ] || exit 0
+[ "${PUSHWARD_ACTIVITIES_ENABLED:-true}" = "false" ] && exit 0
+[ -f "$MON" ] || exit 0
+
+if pgrep -f "pushward-monitor.php daemon" >/dev/null 2>&1; then
+  exit 0
+fi
+
+mkdir -p /var/run/pushward
+setsid php "$MON" daemon >/dev/null 2>&1 &
+exit 0
+]]>
+</INLINE>
+</FILE>
+
+<!-- 6. Dashboard server-side proxy (keeps the key off the browser). -->
+<FILE Name="/usr/local/emhttp/plugins/pushward-unraid/pwapi.php" Mode="0644">
+<INLINE>
+<![CDATA[<?php
+/**
+ * Server-side proxy for the PushWard Activities dashboard.
+ *
+ * Keeps the integration key on the server; the browser never sees it. Exposes:
+ *   ?action=list             -> GET  /activities          (read, no CSRF)
+ *   ?action=authcheck        -> GET  /auth/me             (read, no CSRF)
+ *   action=end   &slug=...   -> PATCH /activities/{slug} {state:ended}  (CSRF)
+ *   action=cancel&slug=...   -> DELETE /activities/{slug}               (CSRF)
+ *
+ * Mutating actions require Unraid's csrf_token (POST), matching the webGUI's
+ * convention; the page is already behind the webGUI's authenticated session.
+ */
+
+header('Content-Type: application/json');
+
+$cfg = @parse_ini_file('/boot/config/plugins/pushward-unraid/pushward-unraid.cfg') ?: [];
+$url = rtrim($cfg['PUSHWARD_URL'] ?? 'https://api.pushward.app', '/');
+$key = trim($cfg['PUSHWARD_API_KEY'] ?? '');
+
+if ($key === '') {
+    http_response_code(400);
+    echo json_encode(['error' => 'PushWard API key not configured']);
+    exit;
+}
+
+$action = $_REQUEST['action'] ?? 'list';
+$slug   = $_REQUEST['slug'] ?? '';
+
+// This dashboard must only ever show / act on THIS server's own activities. The
+// same account/key may also drive the relay (Grafana, Sonarr, Proxmox, etc.) or a
+// second Unraid box; GET /activities is account-wide, so we filter the list to
+// our own slug prefix and refuse mutations on any foreign slug. Mirrors the
+// monitor's slug_prefix().
+$prefix = pw_slug_prefix(trim($cfg['PUSHWARD_SERVER_NAME'] ?? 'Unraid'));
+
+function pw_slug_prefix(string $server): string {
+    $p = strtolower($server);
+    $p = preg_replace('/[^a-z0-9]+/', '-', $p);
+    $p = trim((string) $p, '-');
+    return $p !== '' ? $p : 'unraid';
+}
+
+function pw_owns(string $slug, string $prefix): bool {
+    return $slug === $prefix || str_starts_with($slug, $prefix . '-');
+}
+
+function unraid_csrf(): string {
+    $data = (string) @file_get_contents('/var/local/emhttp/var.ini');
+    if (preg_match('/^csrf_token="?([^"\n]*)"?/m', $data, $m)) {
+        return $m[1];
+    }
+    return '';
+}
+
+function require_csrf(): void {
+    $sent = $_POST['csrf_token'] ?? $_REQUEST['csrf_token'] ?? '';
+    $real = unraid_csrf();
+    if ($real === '' || !hash_equals($real, (string) $sent)) {
+        http_response_code(403);
+        echo json_encode(['error' => 'invalid csrf token']);
+        exit;
+    }
+}
+
+function pw(array $ctx, string $method, string $path, ?array $body, string $ct = 'application/json'): array {
+    $ch = curl_init($ctx['url'] . $path);
+    curl_setopt_array($ch, [
+        CURLOPT_CUSTOMREQUEST  => $method,
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_TIMEOUT        => 20,
+        CURLOPT_CONNECTTIMEOUT => 10,
+        CURLOPT_HTTPHEADER     => [
+            'Authorization: Bearer ' . $ctx['key'],
+            'Content-Type: ' . $ct,
+            'Accept: application/json',
+        ],
+    ]);
+    if ($body !== null) {
+        curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($body, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE));
+    }
+    $resp = curl_exec($ch);
+    $code = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    curl_close($ch);
+    return ['code' => $code, 'body' => (string) $resp];
+}
+
+$ctx = ['url' => $url, 'key' => $key];
+
+switch ($action) {
+    case 'list':
+        $r = pw($ctx, 'GET', '/activities', null);
+        http_response_code($r['code'] ?: 502);
+        // Filter the account-wide list down to our own activities so foreign
+        // ones are never shown (and so their Cancel/delete buttons never exist).
+        if ($r['code'] >= 200 && $r['code'] < 300) {
+            $data = json_decode($r['body'], true);
+            if (is_array($data) && isset($data['items']) && is_array($data['items'])) {
+                $data['items'] = array_values(array_filter($data['items'], function ($a) use ($prefix) {
+                    return is_array($a) && pw_owns((string) ($a['slug'] ?? ''), $prefix);
+                }));
+                echo json_encode($data);
+                break;
+            }
+        }
+        echo $r['body'] !== '' ? $r['body'] : json_encode(['error' => 'no response']);
+        break;
+
+    case 'authcheck':
+        $r = pw($ctx, 'GET', '/auth/me', null);
+        http_response_code($r['code'] ?: 502);
+        echo $r['body'] !== '' ? $r['body'] : json_encode(['error' => 'no response']);
+        break;
+
+    case 'end':
+        require_csrf();
+        if ($slug === '') {
+            http_response_code(400);
+            echo json_encode(['error' => 'missing slug']);
+            break;
+        }
+        if (!pw_owns($slug, $prefix)) {
+            http_response_code(403);
+            echo json_encode(['error' => 'slug not owned by this server']);
+            break;
+        }
+        $r = pw($ctx, 'PATCH', '/activities/' . rawurlencode($slug), ['state' => 'ended'], 'application/merge-patch+json');
+        http_response_code($r['code'] ?: 502);
+        echo $r['body'] !== '' ? $r['body'] : json_encode(['ok' => true]);
+        break;
+
+    case 'cancel':
+        require_csrf();
+        if ($slug === '') {
+            http_response_code(400);
+            echo json_encode(['error' => 'missing slug']);
+            break;
+        }
+        if (!pw_owns($slug, $prefix)) {
+            http_response_code(403);
+            echo json_encode(['error' => 'slug not owned by this server']);
+            break;
+        }
+        $r = pw($ctx, 'DELETE', '/activities/' . rawurlencode($slug), null);
+        http_response_code($r['code'] ?: 502);
+        echo $r['body'] !== '' ? $r['body'] : json_encode(['ok' => true]);
+        break;
+
+    default:
+        http_response_code(400);
+        echo json_encode(['error' => 'unknown action']);
+}
+]]>
+</INLINE>
+</FILE>
+
+<!-- 7. Test Live Activity helper (Settings page button). -->
+<FILE Name="/usr/local/emhttp/plugins/pushward-unraid/test-activity.sh" Mode="0755">
+<INLINE>
+<![CDATA[#!/bin/bash
+# Push a short demo Live Activity so the user can verify push-to-start works,
+# straight from Settings -> PushWard.
+MON="/usr/local/emhttp/plugins/pushward-unraid/pushward-monitor.php"
+if [ ! -f "$MON" ]; then
+  echo "PushWard monitor not installed at $MON" >&2
+  exit 1
+fi
+php "$MON" test-activity
+]]>
+</INLINE>
+</FILE>
+
+<!-- 8. Array event: start the monitor when disks mount. -->
+<FILE Name="/usr/local/emhttp/plugins/pushward-unraid/event/disks_mounted" Mode="0755">
+<INLINE>
+<![CDATA[#!/bin/bash
+# Array/disks came up: make sure the PushWard monitor daemon is running.
+/usr/local/emhttp/plugins/pushward-unraid/watchdog.sh >/dev/null 2>&1 &
+exit 0
+]]>
+</INLINE>
+</FILE>
+
+<!-- 9. Array event: stop monitor and end activities when unmounting. -->
+<FILE Name="/usr/local/emhttp/plugins/pushward-unraid/event/unmounting_disks" Mode="0755">
+<INLINE>
+<![CDATA[#!/bin/bash
+# Array is stopping: stop the monitor and end any active Live Activities so the
+# user isn't left with a frozen "Parity 50%" card after the array goes down.
+
+PAT="pushward-monitor.php daemon"
+
+# Stop the daemon and WAIT for it to actually be gone before ending activities.
+# Otherwise its in-flight tick can re-PATCH an activity back to 'ongoing' after
+# end-all sets it 'ended', and its later state.json write (active=true) clobbers
+# end-all's, leaving the exact frozen card this hook exists to clear. A short
+# TERM grace then SIGKILL guarantees no competing writer when end-all runs.
+pkill -TERM -f "$PAT" >/dev/null 2>&1
+for _ in $(seq 1 30); do
+  pgrep -f "$PAT" >/dev/null 2>&1 || break
+  sleep 0.1
+done
+pkill -KILL -f "$PAT" >/dev/null 2>&1
+
+php /usr/local/emhttp/plugins/pushward-unraid/pushward-monitor.php end-all >/dev/null 2>&1 &
+exit 0
+]]>
+</INLINE>
+</FILE>
+
+<!-- 10. Settings page (Settings -> PushWard). -->
+<FILE Name="/usr/local/emhttp/plugins/pushward-unraid/pushward-unraid.page" Mode="0644">
+<INLINE>
+<![CDATA[Menu="OtherSettings"
+Title="PushWard"
+Icon="bell"
+Tag="bell"
+---
+<?PHP
+/* Copyright 2026, mac-lucky. Licensed MIT. */
+$plugin   = "pushward-unraid";
+$cfg_path = "/boot/config/plugins/{$plugin}/{$plugin}.cfg";
+$cfg      = file_exists($cfg_path) ? @parse_ini_file($cfg_path) : [];
+
+function pw_val($cfg, $key, $default = '') {
+    return htmlspecialchars($cfg[$key] ?? $default, ENT_QUOTES);
+}
+function pw_yesno($cfg, $key, $default) {
+    $v = ($cfg[$key] ?? $default) !== 'false';
+    $t = $v ? ' selected' : '';
+    $f = $v ? '' : ' selected';
+    return "<option value='true'$t>Enabled</option><option value='false'$f>Disabled</option>";
+}
+$configured = !empty($cfg['PUSHWARD_API_KEY']);
+
+// Live status (best-effort, short timeouts so the page never hangs).
+$me = null; $actCode = 0; $daemon = false; $logTail = '';
+if ($configured) {
+    $url = rtrim($cfg['PUSHWARD_URL'] ?? 'https://api.pushward.app', '/');
+    $key = $cfg['PUSHWARD_API_KEY'];
+    $h = ["Authorization: Bearer $key", "Accept: application/json"];
+    $c = curl_init("$url/auth/me");
+    curl_setopt_array($c, [CURLOPT_RETURNTRANSFER => true, CURLOPT_TIMEOUT => 6, CURLOPT_HTTPHEADER => $h]);
+    $b = curl_exec($c); $code = (int) curl_getinfo($c, CURLINFO_HTTP_CODE); curl_close($c);
+    if ($code >= 200 && $code < 300) { $me = json_decode($b, true); }
+    $c = curl_init("$url/activities?state=ONGOING");
+    curl_setopt_array($c, [CURLOPT_RETURNTRANSFER => true, CURLOPT_TIMEOUT => 6, CURLOPT_NOBODY => false, CURLOPT_HTTPHEADER => $h]);
+    curl_exec($c); $actCode = (int) curl_getinfo($c, CURLINFO_HTTP_CODE); curl_close($c);
+    // Match the same precise pattern the watchdog/pkill use ("...daemon"), not a
+    // bare "pushward-monitor.php" that also matches a transient one-shot
+    // subcommand (test-activity/once/end-all) and falsely reports "running".
+    // The [.] keeps the pattern from matching this exec's own sh -c argv.
+    @exec('pgrep -f "pushward-monitor[.]php daemon" 2>/dev/null', $pg); $daemon = !empty($pg);
+    if (is_file('/var/log/pushward-monitor.log')) {
+        $logTail = htmlspecialchars(implode('', array_slice((array) @file('/var/log/pushward-monitor.log'), -10)), ENT_QUOTES);
+    }
+}
+?>
+
+<style>
+.pw-ok   { color: #5b9b5b; font-weight: bold; }
+.pw-warn { color: #b5651d; font-weight: bold; }
+.pw-bad  { color: #c0392b; font-weight: bold; }
+.pw-log  { font-family: var(--font-mono, monospace); font-size: .8em; white-space: pre-wrap; background: rgba(128,128,128,.12); padding: 8px; border-radius: 6px; max-height: 160px; overflow: auto; }
+</style>
+
+Status:
+: <span class="pw-<?= $configured ? 'ok' : 'warn' ?>"><?= $configured ? 'API key set' : 'not configured' ?></span>
+
+<?PHP if ($configured): ?>
+Account:
+: <?= $me ? '<span class="pw-ok">key valid</span>' . ($me['nickname'] ? ' (' . htmlspecialchars($me['nickname'], ENT_QUOTES) . ')' : '') : '<span class="pw-bad">key rejected (' . ($actCode ?: 'no response') . ')</span>' ?>
+
+Subscription:
+: <?= $me ? ($me['subscribed'] ? '<span class="pw-ok">active</span>, Live Activities enabled' : '<span class="pw-bad">none</span>; creating/updating activities needs an active subscription') : '<span class="pw-warn">unknown</span>' ?>
+
+Activity API:
+: <?= $actCode === 200 ? '<span class="pw-ok">reachable</span>' : '<span class="pw-warn">HTTP ' . htmlspecialchars((string) $actCode, ENT_QUOTES) . '</span>' ?>
+
+Monitor daemon:
+: <?= $daemon ? '<span class="pw-ok">running</span>' : '<span class="pw-warn">not running</span> (starts within a minute when activities are enabled)' ?>
+
+<?PHP endif; ?>
+
+<form markdown="1" name="pushward_unraid_settings" method="POST" action="/update.php" target="progressFrame" onsubmit="return pwKeepKey();">
+<input type="hidden" name="#file" value="<?= $cfg_path ?>">
+
+PushWard server URL:
+: <input type="text" name="PUSHWARD_URL" maxlength="200" value="<?= pw_val($cfg,'PUSHWARD_URL','https://api.pushward.app') ?>">
+
+PushWard API key:
+: <input type="password" id="pushward_api_key" name="PUSHWARD_API_KEY" maxlength="200" value="" placeholder="<?= $configured ? 'leave blank to keep current key' : 'hlk_...' ?>">
+
+Server display name:
+: <input type="text" name="PUSHWARD_SERVER_NAME" maxlength="100" value="<?= pw_val($cfg,'PUSHWARD_SERVER_NAME','Unraid') ?>">
+
+Live Activities:
+: <select name="PUSHWARD_ACTIVITIES_ENABLED"><?= pw_yesno($cfg,'PUSHWARD_ACTIVITIES_ENABLED','true') ?></select>
+
+Track parity check / rebuild:
+: <select name="PUSHWARD_TRACK_PARITY"><?= pw_yesno($cfg,'PUSHWARD_TRACK_PARITY','true') ?></select>
+
+Track appdata backup:
+: <select name="PUSHWARD_TRACK_BACKUP"><?= pw_yesno($cfg,'PUSHWARD_TRACK_BACKUP','true') ?></select>
+
+Track mover:
+: <select name="PUSHWARD_TRACK_MOVER"><?= pw_yesno($cfg,'PUSHWARD_TRACK_MOVER','true') ?></select>
+
+Poll interval (seconds):
+: <input type="number" name="PUSHWARD_POLL_INTERVAL" min="5" max="300" value="<?= pw_val($cfg,'PUSHWARD_POLL_INTERVAL','15') ?>">
+
+Activity priority (0-10):
+: <input type="number" name="PUSHWARD_ACTIVITY_PRIORITY" min="0" max="10" value="<?= pw_val($cfg,'PUSHWARD_ACTIVITY_PRIORITY','5') ?>">
+
+&nbsp;
+: <input type="submit" name="apply" value="Apply"> <input type="button" value="Done" onclick="done()">
+
+</form>
+
+<script>
+// Never render the stored API key into the page (View-Source / DOM / form-cache
+// would leak it). The field ships empty; if left blank on Apply, drop its name
+// so it isn't POSTed and update.php preserves the existing key (it merges the
+// POST over the on-disk cfg). A typed value overwrites as normal.
+function pwKeepKey() {
+  var k = document.getElementById('pushward_api_key');
+  if (k && k.value === '') k.removeAttribute('name');
+  return true;
+}
+</script>
+
+<form markdown="1" name="pushward_unraid_test" method="POST" action="/update.php" target="progressFrame">
+<input type="hidden" name="#command" value="/usr/local/emhttp/plugins/<?= $plugin ?>/test.sh">
+&nbsp;
+: <input type="submit" value="Send test notification">
+
+</form>
+
+<form markdown="1" name="pushward_unraid_test_activity" method="POST" action="/update.php" target="progressFrame">
+<input type="hidden" name="#command" value="/usr/local/emhttp/plugins/<?= $plugin ?>/test-activity.sh">
+&nbsp;
+: <input type="submit" value="Send test Live Activity">
+
+</form>
+
+> Notifications: Unraid calls the agent for any importance with the **Agent**
+> method enabled under Settings &rarr; Notifications (Warning and Alert by
+> default). Live Activities: a background monitor watches parity checks, appdata
+> backups and the mover and pushes progress to your phone. View them under
+> Settings &rarr; **PushWard Activities**.
+
+<?PHP if ($configured && $logTail): ?>
+
+Monitor log (last lines):
+: <div class="pw-log"><?= $logTail ?></div>
+
+<?PHP endif; ?>
+]]>
+</INLINE>
+</FILE>
+
+<!-- 11. Activities dashboard page (Settings -> PushWard Activities). -->
+<FILE Name="/usr/local/emhttp/plugins/pushward-unraid/pushward-activities.page" Mode="0644">
+<INLINE>
+<![CDATA[Menu="OtherSettings"
+Title="PushWard Activities"
+Icon="bell"
+Tag="bell"
+---
+<?PHP
+/* Copyright 2026, mac-lucky. Licensed MIT. */
+$plugin   = "pushward-unraid";
+$cfg_path = "/boot/config/plugins/{$plugin}/{$plugin}.cfg";
+$cfg      = file_exists($cfg_path) ? @parse_ini_file($cfg_path) : [];
+$configured = !empty($cfg['PUSHWARD_API_KEY']);
+$csrf = '';
+if (preg_match('/^csrf_token="?([^"\n]*)"?/m', (string) @file_get_contents('/var/local/emhttp/var.ini'), $m)) {
+    $csrf = $m[1];
+}
+?>
+
+<style>
+.pw-wrap { max-width: 900px; }
+.pw-card { border: 1px solid var(--border-color, #999); border-radius: 8px; padding: 12px 14px; margin: 10px 0; }
+.pw-head { display: flex; align-items: center; gap: 8px; }
+.pw-name { font-weight: bold; font-size: 1.05em; }
+.pw-badge { font-size: .75em; padding: 1px 7px; border-radius: 10px; border: 1px solid #888; opacity: .8; }
+.pw-state-ongoing { color: #4a90d9; }
+.pw-state-ended   { color: #5b9b5b; }
+.pw-state-preempted { color: #b5651d; }
+.pw-sub { opacity: .75; font-size: .9em; margin-top: 2px; }
+.pw-bar { height: 8px; border-radius: 4px; background: rgba(128,128,128,.25); overflow: hidden; margin: 8px 0; }
+.pw-bar > span { display: block; height: 100%; background: #4a90d9; transition: width .4s ease; }
+.pw-lines { font-family: var(--font-mono, monospace); font-size: .8em; opacity: .85; margin-top: 6px; max-height: 120px; overflow: auto; }
+.pw-lines div { padding: 1px 0; white-space: pre-wrap; }
+.pw-lvl-warn { color: #b5651d; }
+.pw-lvl-error { color: #c0392b; }
+.pw-actions { margin-top: 8px; display: flex; gap: 8px; }
+.pw-actions button { cursor: pointer; }
+.pw-empty { opacity: .7; padding: 20px 0; }
+.pw-warn { color: #b5651d; font-weight: bold; }
+.pw-foot { opacity: .6; font-size: .85em; margin-top: 12px; }
+</style>
+
+<div class="pw-wrap">
+<?PHP if (!$configured): ?>
+<p class="pw-warn">No API key configured. Set one under <a href="/Settings/pushward-unraid">Settings &rarr; PushWard</a> first.</p>
+<?PHP else: ?>
+<div id="pw-activities"><p class="pw-empty">Loading current Live Activities&hellip;</p></div>
+<div id="pw-msg" class="pw-warn" role="alert"></div>
+<div class="pw-foot">Auto-refreshing every 5s &middot; <span id="pw-updated"></span></div>
+<?PHP endif; ?>
+</div>
+
+<?PHP if ($configured): ?>
+<script>
+(function () {
+  var API = '/plugins/pushward-unraid/pwapi.php';
+  var CSRF = '<?= htmlspecialchars($csrf, ENT_QUOTES) ?>';
+  var box = document.getElementById('pw-activities');
+  var upd = document.getElementById('pw-updated');
+  var msgEl = document.getElementById('pw-msg');
+  var msgTimer = null;
+
+  // textContent so a server error string can never inject markup.
+  function showMsg(s) {
+    if (!msgEl) return;
+    msgEl.textContent = s || '';
+    if (msgTimer) clearTimeout(msgTimer);
+    if (s) msgTimer = setTimeout(function () { msgEl.textContent = ''; }, 8000);
+  }
+
+  function errText(d, status) {
+    if (d && (d.error || d.detail || d.title)) return d.error || d.detail || d.title;
+    return 'HTTP ' + status;
+  }
+
+  function esc(s) {
+    var d = document.createElement('div');
+    d.textContent = (s == null ? '' : String(s));
+    // textContent->innerHTML escapes < > &; also escape quotes so the result is
+    // safe inside HTML attributes too.
+    return d.innerHTML.replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+  }
+
+  function rel(ts) {
+    if (!ts) return '';
+    var t = (typeof ts === 'string') ? Date.parse(ts) : ts * 1000;
+    if (isNaN(t)) return '';
+    var s = Math.max(0, Math.round((Date.now() - t) / 1000));
+    if (s < 60) return s + 's ago';
+    if (s < 3600) return Math.round(s / 60) + 'm ago';
+    return Math.round(s / 3600) + 'h ago';
+  }
+
+  function order(a, b) {
+    var rank = { ongoing: 0, preempted: 1, ended: 2 };
+    // `?? 9` not `|| 9`: ongoing ranks 0, which is falsy, so `|| 9` would push live
+    // activities to the BOTTOM, the inverse of the intended "active first".
+    return (rank[a.state] ?? 9) - (rank[b.state] ?? 9);
+  }
+
+  function render(items) {
+    if (!items.length) { box.innerHTML = '<p class="pw-empty">No Live Activities right now. They appear here while a parity check, appdata backup or mover runs.</p>'; return; }
+    items.sort(order);
+    var html = '';
+    items.forEach(function (a) {
+      var c = a.content || {};
+      var prog = (typeof c.progress === 'number') ? Math.round(c.progress * 100) : null;
+      html += '<div class="pw-card">';
+      html += '<div class="pw-head">';
+      html += '<span class="pw-name">' + esc(a.name || a.slug) + '</span>';
+      html += '<span class="pw-badge">' + esc(c.template || '') + '</span>';
+      html += '<span class="pw-badge pw-state-' + esc(a.state) + '">' + esc(a.state) + '</span>';
+      html += '</div>';
+      if (c.state) html += '<div>' + esc(c.state) + '</div>';
+      if (c.subtitle) html += '<div class="pw-sub">' + esc(c.subtitle) + '</div>';
+      if (prog !== null) html += '<div class="pw-bar"><span style="width:' + prog + '%"></span></div>';
+      if (Array.isArray(c.lines) && c.lines.length) {
+        html += '<div class="pw-lines">';
+        c.lines.forEach(function (ln) { html += '<div class="pw-lvl-' + esc(ln.level || 'info') + '">' + esc(ln.text) + '</div>'; });
+        html += '</div>';
+      }
+      html += '<div class="pw-sub">slug ' + esc(a.slug) + ' &middot; ' + rel(a.updated_at) + '</div>';
+      if (a.state === 'ongoing' || a.state === 'preempted') {
+        html += '<div class="pw-actions">';
+        html += '<button data-act="end" data-slug="' + esc(a.slug) + '">End</button>';
+        html += '<button data-act="cancel" data-slug="' + esc(a.slug) + '">Cancel (delete)</button>';
+        html += '</div>';
+      }
+      html += '</div>';
+    });
+    box.innerHTML = html;
+  }
+
+  function pwAct(action, slug) {
+    if (action === 'cancel' && !confirm('Delete activity "' + slug + '"? This removes it for all your devices.')) return;
+    var body = 'action=' + encodeURIComponent(action) + '&slug=' + encodeURIComponent(slug) + '&csrf_token=' + encodeURIComponent(CSRF);
+    fetch(API, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: body })
+      .then(function (r) {
+        return r.text().then(function (t) {
+          // Surface failures (403 missing/rotated CSRF or scope, 404, 5xx)
+          // instead of silently reloading so the action looks like a no-op.
+          if (!r.ok) {
+            var d = {}; try { d = JSON.parse(t); } catch (e) {}
+            showMsg((action === 'cancel' ? 'Cancel' : 'End') + ' failed: ' + errText(d, r.status));
+          } else {
+            showMsg('');
+          }
+          load();
+        });
+      })
+      .catch(function () { showMsg('Request failed: could not reach the plugin proxy.'); load(); });
+  }
+
+  // Delegated handler (no inline onclick) so a quote in a slug can't inject.
+  box.addEventListener('click', function (e) {
+    var btn = e.target.closest && e.target.closest('button[data-act]');
+    if (btn) pwAct(btn.getAttribute('data-act'), btn.getAttribute('data-slug'));
+  });
+
+  function load() {
+    fetch(API + '?action=list', { headers: { 'Accept': 'application/json' } })
+      .then(function (r) {
+        return r.text().then(function (t) {
+          var d = {}; try { d = JSON.parse(t); } catch (e) {}
+          // Don't let a 401/expired-key or proxy 502 fall through to an empty
+          // list, which renders a reassuring "nothing running" during an actual
+          // outage. Show the error instead.
+          if (!r.ok) {
+            box.innerHTML = '<p class="pw-warn">PushWard API error: ' + esc(errText(d, r.status)) +
+              '. Check the key and server URL in Settings &rarr; PushWard.</p>';
+            if (upd) upd.textContent = 'error ' + new Date().toLocaleTimeString();
+            return;
+          }
+          var items = d.items || d.activities || d.data || [];
+          render(items);
+          if (upd) upd.textContent = 'updated ' + new Date().toLocaleTimeString();
+        });
+      })
+      .catch(function () {
+        box.innerHTML = '<p class="pw-warn">Could not reach the PushWard API. Check the key and server URL in Settings &rarr; PushWard.</p>';
+      });
+  }
+
+  load();
+  setInterval(load, 5000);
+})();
+</script>
+<?PHP endif; ?>
+]]>
+</INLINE>
+</FILE>
+
+<!-- 12. Watchdog cron. -->
+<FILE Name="/boot/config/plugins/pushward-unraid/pushward-unraid.cron" Mode="0644">
+<INLINE>
+<![CDATA[# PushWard monitor watchdog. Restarts the Live Activity daemon if it died.
+* * * * * /usr/local/emhttp/plugins/pushward-unraid/watchdog.sh >/dev/null 2>&1
+]]>
+</INLINE>
+</FILE>
+
+<!-- 13. Post-install: register cron, start monitor, print summary. -->
+<FILE Run="/bin/bash">
+<INLINE>
+<![CDATA[
+mkdir -p /var/run/pushward
+# Restart the monitor so an upgrade picks up the new code (a long-running PHP
+# process keeps the old file in memory). Wait for the old daemon to be fully
+# gone (TERM grace then KILL) so it releases its flock before the watchdog
+# launches the new one, since a still-alive old instance would keep the lock and the
+# fresh daemon would exit immediately. Then register the watchdog cron.
+PAT="pushward-monitor.php daemon"
+pkill -TERM -f "$PAT" 2>/dev/null || true
+for _ in $(seq 1 30); do
+  pgrep -f "$PAT" >/dev/null 2>&1 || break
+  sleep 0.1
+done
+pkill -KILL -f "$PAT" 2>/dev/null || true
+/usr/local/sbin/update_cron >/dev/null 2>&1 || true
+/usr/local/emhttp/plugins/pushward-unraid/watchdog.sh >/dev/null 2>&1 || true
+
+cat <<EOF
+
+================================================================
+  PushWard Unraid plugin installed.
+
+  Configure your API key at:  Settings -> PushWard
+  Live Activities dashboard:  Settings -> PushWard Activities
+
+  Notifications use an integration key with the 'notifications'
+  capability. Live Activities (parity, appdata backup, mover) need
+  the same key to also have 'activity:manage' scope and an active
+  subscription. The Settings page shows the live status.
+================================================================
+
+EOF
+]]>
+</INLINE>
+</FILE>
+
+<!-- 14. Removal: stop monitor, end activities, drop agent/pages/cron; keep config. -->
+<FILE Run="/bin/bash" Method="remove">
+<INLINE>
+<![CDATA[
+echo "Uninstalling pushward-unraid plugin..."
+# Stop the monitor and end any active Live Activities before removing its code.
+# Wait for the daemon to be fully gone (TERM grace then KILL) so it can't re-PATCH
+# an activity back to 'ongoing' after end-all ends it.
+PAT="pushward-monitor.php daemon"
+pkill -TERM -f "$PAT" 2>/dev/null || true
+for _ in $(seq 1 30); do
+  pgrep -f "$PAT" >/dev/null 2>&1 || break
+  sleep 0.1
+done
+pkill -KILL -f "$PAT" 2>/dev/null || true
+php /usr/local/emhttp/plugins/pushward-unraid/pushward-monitor.php end-all >/dev/null 2>&1 || true
+rm -f /boot/config/plugins/dynamix/notifications/agents/PushWard
+rm -f /boot/config/plugins/dynamix/notifications/agents-disabled/PushWard
+rm -f /boot/config/plugins/pushward-unraid/pushward-unraid.cron
+/usr/local/sbin/update_cron >/dev/null 2>&1 || true
+rm -rf /usr/local/emhttp/plugins/pushward-unraid
+rm -rf /var/run/pushward
+echo "Removed the agent, monitor, settings/dashboard pages and cron."
+echo "Persistent config under /boot/config/plugins/pushward-unraid/ left intact."
+]]>
+</INLINE>
+</FILE>
+
+</PLUGIN>
