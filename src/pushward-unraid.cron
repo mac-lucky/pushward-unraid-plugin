@@ -1,0 +1,2 @@
+# PushWard monitor watchdog. Restarts the Live Activity daemon if it died.
+* * * * * /usr/local/emhttp/plugins/pushward-unraid/watchdog.sh >/dev/null 2>&1

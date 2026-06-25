@@ -1,0 +1,12 @@
+# Local agent/dev guide. Private (references the dev box + SSH), kept out of this
+# public repo per docs/ai_tell.md.
+CLAUDE.md
+
+# OS / editor noise
+.DS_Store
+._*
+*.swp
+
+# Build scratch
+*.tmp
+/tmp/

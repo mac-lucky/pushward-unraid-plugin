@@ -1,0 +1,144 @@
+Menu="OtherSettings"
+Title="PushWard"
+Icon="bell"
+Tag="bell"
+---
+<?PHP
+/* Copyright 2026, mac-lucky. Licensed MIT. */
+$plugin   = "pushward-unraid";
+$cfg_path = "/boot/config/plugins/{$plugin}/{$plugin}.cfg";
+$cfg      = file_exists($cfg_path) ? @parse_ini_file($cfg_path) : [];
+
+function pw_val($cfg, $key, $default = '') {
+    return htmlspecialchars($cfg[$key] ?? $default, ENT_QUOTES);
+}
+function pw_yesno($cfg, $key, $default) {
+    $v = ($cfg[$key] ?? $default) !== 'false';
+    $t = $v ? ' selected' : '';
+    $f = $v ? '' : ' selected';
+    return "<option value='true'$t>Enabled</option><option value='false'$f>Disabled</option>";
+}
+$configured = !empty($cfg['PUSHWARD_API_KEY']);
+
+// Live status (best-effort, short timeouts so the page never hangs).
+$me = null; $actCode = 0; $daemon = false; $logTail = '';
+if ($configured) {
+    $url = rtrim($cfg['PUSHWARD_URL'] ?? 'https://api.pushward.app', '/');
+    $key = $cfg['PUSHWARD_API_KEY'];
+    $h = ["Authorization: Bearer $key", "Accept: application/json"];
+    $c = curl_init("$url/auth/me");
+    curl_setopt_array($c, [CURLOPT_RETURNTRANSFER => true, CURLOPT_TIMEOUT => 6, CURLOPT_HTTPHEADER => $h]);
+    $b = curl_exec($c); $code = (int) curl_getinfo($c, CURLINFO_HTTP_CODE); curl_close($c);
+    if ($code >= 200 && $code < 300) { $me = json_decode($b, true); }
+    $c = curl_init("$url/activities?state=ONGOING");
+    curl_setopt_array($c, [CURLOPT_RETURNTRANSFER => true, CURLOPT_TIMEOUT => 6, CURLOPT_NOBODY => false, CURLOPT_HTTPHEADER => $h]);
+    curl_exec($c); $actCode = (int) curl_getinfo($c, CURLINFO_HTTP_CODE); curl_close($c);
+    // Match the same precise pattern the watchdog/pkill use ("...daemon"), not a
+    // bare "pushward-monitor.php" that also matches a transient one-shot
+    // subcommand (test-activity/once/end-all) and falsely reports "running".
+    // The [.] keeps the pattern from matching this exec's own sh -c argv.
+    @exec('pgrep -f "pushward-monitor[.]php daemon" 2>/dev/null', $pg); $daemon = !empty($pg);
+    if (is_file('/var/log/pushward-monitor.log')) {
+        $logTail = htmlspecialchars(implode('', array_slice((array) @file('/var/log/pushward-monitor.log'), -10)), ENT_QUOTES);
+    }
+}
+?>
+
+<style>
+.pw-ok   { color: #5b9b5b; font-weight: bold; }
+.pw-warn { color: #b5651d; font-weight: bold; }
+.pw-bad  { color: #c0392b; font-weight: bold; }
+.pw-log  { font-family: var(--font-mono, monospace); font-size: .8em; white-space: pre-wrap; background: rgba(128,128,128,.12); padding: 8px; border-radius: 6px; max-height: 160px; overflow: auto; }
+</style>
+
+Status:
+: <span class="pw-<?= $configured ? 'ok' : 'warn' ?>"><?= $configured ? 'API key set' : 'not configured' ?></span>
+
+<?PHP if ($configured): ?>
+Account:
+: <?= $me ? '<span class="pw-ok">key valid</span>' . ($me['nickname'] ? ' (' . htmlspecialchars($me['nickname'], ENT_QUOTES) . ')' : '') : '<span class="pw-bad">key rejected (' . ($actCode ?: 'no response') . ')</span>' ?>
+
+Subscription:
+: <?= $me ? ($me['subscribed'] ? '<span class="pw-ok">active</span>, Live Activities enabled' : '<span class="pw-bad">none</span>; creating/updating activities needs an active subscription') : '<span class="pw-warn">unknown</span>' ?>
+
+Activity API:
+: <?= $actCode === 200 ? '<span class="pw-ok">reachable</span>' : '<span class="pw-warn">HTTP ' . htmlspecialchars((string) $actCode, ENT_QUOTES) . '</span>' ?>
+
+Monitor daemon:
+: <?= $daemon ? '<span class="pw-ok">running</span>' : '<span class="pw-warn">not running</span> (starts within a minute when activities are enabled)' ?>
+
+<?PHP endif; ?>
+
+<form markdown="1" name="pushward_unraid_settings" method="POST" action="/update.php" target="progressFrame" onsubmit="return pwKeepKey();">
+<input type="hidden" name="#file" value="<?= $cfg_path ?>">
+
+PushWard server URL:
+: <input type="text" name="PUSHWARD_URL" maxlength="200" value="<?= pw_val($cfg,'PUSHWARD_URL','https://api.pushward.app') ?>">
+
+PushWard API key:
+: <input type="password" id="pushward_api_key" name="PUSHWARD_API_KEY" maxlength="200" value="" placeholder="<?= $configured ? 'leave blank to keep current key' : 'hlk_...' ?>">
+
+Server display name:
+: <input type="text" name="PUSHWARD_SERVER_NAME" maxlength="100" value="<?= pw_val($cfg,'PUSHWARD_SERVER_NAME','Unraid') ?>">
+
+Live Activities:
+: <select name="PUSHWARD_ACTIVITIES_ENABLED"><?= pw_yesno($cfg,'PUSHWARD_ACTIVITIES_ENABLED','true') ?></select>
+
+Track parity check / rebuild:
+: <select name="PUSHWARD_TRACK_PARITY"><?= pw_yesno($cfg,'PUSHWARD_TRACK_PARITY','true') ?></select>
+
+Track appdata backup:
+: <select name="PUSHWARD_TRACK_BACKUP"><?= pw_yesno($cfg,'PUSHWARD_TRACK_BACKUP','true') ?></select>
+
+Track mover:
+: <select name="PUSHWARD_TRACK_MOVER"><?= pw_yesno($cfg,'PUSHWARD_TRACK_MOVER','true') ?></select>
+
+Poll interval (seconds):
+: <input type="number" name="PUSHWARD_POLL_INTERVAL" min="5" max="300" value="<?= pw_val($cfg,'PUSHWARD_POLL_INTERVAL','15') ?>">
+
+Activity priority (0-10):
+: <input type="number" name="PUSHWARD_ACTIVITY_PRIORITY" min="0" max="10" value="<?= pw_val($cfg,'PUSHWARD_ACTIVITY_PRIORITY','5') ?>">
+
+&nbsp;
+: <input type="submit" name="apply" value="Apply"> <input type="button" value="Done" onclick="done()">
+
+</form>
+
+<script>
+// Never render the stored API key into the page (View-Source / DOM / form-cache
+// would leak it). The field ships empty; if left blank on Apply, drop its name
+// so it isn't POSTed and update.php preserves the existing key (it merges the
+// POST over the on-disk cfg). A typed value overwrites as normal.
+function pwKeepKey() {
+  var k = document.getElementById('pushward_api_key');
+  if (k && k.value === '') k.removeAttribute('name');
+  return true;
+}
+</script>
+
+<form markdown="1" name="pushward_unraid_test" method="POST" action="/update.php" target="progressFrame">
+<input type="hidden" name="#command" value="/usr/local/emhttp/plugins/<?= $plugin ?>/test.sh">
+&nbsp;
+: <input type="submit" value="Send test notification">
+
+</form>
+
+<form markdown="1" name="pushward_unraid_test_activity" method="POST" action="/update.php" target="progressFrame">
+<input type="hidden" name="#command" value="/usr/local/emhttp/plugins/<?= $plugin ?>/test-activity.sh">
+&nbsp;
+: <input type="submit" value="Send test Live Activity">
+
+</form>
+
+> Notifications: Unraid calls the agent for any importance with the **Agent**
+> method enabled under Settings &rarr; Notifications (Warning and Alert by
+> default). Live Activities: a background monitor watches parity checks, appdata
+> backups and the mover and pushes progress to your phone. View them under
+> Settings &rarr; **PushWard Activities**.
+
+<?PHP if ($configured && $logTail): ?>
+
+Monitor log (last lines):
+: <div class="pw-log"><?= $logTail ?></div>
+
+<?PHP endif; ?>

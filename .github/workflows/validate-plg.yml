@@ -3,9 +3,9 @@ name: Validate plugin
 on:
   push:
     branches: [main]
-    paths: ['pushward-unraid.plg', '.github/workflows/validate-plg.yml']
+    paths: ['pushward-unraid.plg', 'src/**', 'build-plg.sh', '.github/workflows/validate-plg.yml']
   pull_request:
-    paths: ['pushward-unraid.plg', '.github/workflows/validate-plg.yml']
+    paths: ['pushward-unraid.plg', 'src/**', 'build-plg.sh', '.github/workflows/validate-plg.yml']
   workflow_dispatch:
 
 jobs:
@@ -13,6 +13,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - name: Check pushward-unraid.plg is in sync with src/
+        run: |
+          bash build-plg.sh /tmp/rebuilt.plg >/dev/null
+          if ! diff -u pushward-unraid.plg /tmp/rebuilt.plg; then
+            echo "::error::pushward-unraid.plg is stale. Run ./build-plg.sh and commit the result."
+            exit 1
+          fi
 
       - name: Install validators
         run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends libxml2-utils shellcheck php-cli >/dev/null

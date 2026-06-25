@@ -1,0 +1,186 @@
+Menu="OtherSettings"
+Title="PushWard Activities"
+Icon="bell"
+Tag="bell"
+---
+<?PHP
+/* Copyright 2026, mac-lucky. Licensed MIT. */
+$plugin   = "pushward-unraid";
+$cfg_path = "/boot/config/plugins/{$plugin}/{$plugin}.cfg";
+$cfg      = file_exists($cfg_path) ? @parse_ini_file($cfg_path) : [];
+$configured = !empty($cfg['PUSHWARD_API_KEY']);
+$csrf = '';
+if (preg_match('/^csrf_token="?([^"\n]*)"?/m', (string) @file_get_contents('/var/local/emhttp/var.ini'), $m)) {
+    $csrf = $m[1];
+}
+?>
+
+<style>
+.pw-wrap { max-width: 900px; }
+.pw-card { border: 1px solid var(--border-color, #999); border-radius: 8px; padding: 12px 14px; margin: 10px 0; }
+.pw-head { display: flex; align-items: center; gap: 8px; }
+.pw-name { font-weight: bold; font-size: 1.05em; }
+.pw-badge { font-size: .75em; padding: 1px 7px; border-radius: 10px; border: 1px solid #888; opacity: .8; }
+.pw-state-ongoing { color: #4a90d9; }
+.pw-state-ended   { color: #5b9b5b; }
+.pw-state-preempted { color: #b5651d; }
+.pw-sub { opacity: .75; font-size: .9em; margin-top: 2px; }
+.pw-bar { height: 8px; border-radius: 4px; background: rgba(128,128,128,.25); overflow: hidden; margin: 8px 0; }
+.pw-bar > span { display: block; height: 100%; background: #4a90d9; transition: width .4s ease; }
+.pw-lines { font-family: var(--font-mono, monospace); font-size: .8em; opacity: .85; margin-top: 6px; max-height: 120px; overflow: auto; }
+.pw-lines div { padding: 1px 0; white-space: pre-wrap; }
+.pw-lvl-warn { color: #b5651d; }
+.pw-lvl-error { color: #c0392b; }
+.pw-actions { margin-top: 8px; display: flex; gap: 8px; }
+.pw-actions button { cursor: pointer; }
+.pw-empty { opacity: .7; padding: 20px 0; }
+.pw-warn { color: #b5651d; font-weight: bold; }
+.pw-foot { opacity: .6; font-size: .85em; margin-top: 12px; }
+</style>
+
+<div class="pw-wrap">
+<?PHP if (!$configured): ?>
+<p class="pw-warn">No API key configured. Set one under <a href="/Settings/pushward-unraid">Settings &rarr; PushWard</a> first.</p>
+<?PHP else: ?>
+<div id="pw-activities"><p class="pw-empty">Loading current Live Activities&hellip;</p></div>
+<div id="pw-msg" class="pw-warn" role="alert"></div>
+<div class="pw-foot">Auto-refreshing every 5s &middot; <span id="pw-updated"></span></div>
+<?PHP endif; ?>
+</div>
+
+<?PHP if ($configured): ?>
+<script>
+(function () {
+  var API = '/plugins/pushward-unraid/pwapi.php';
+  var CSRF = '<?= htmlspecialchars($csrf, ENT_QUOTES) ?>';
+  var box = document.getElementById('pw-activities');
+  var upd = document.getElementById('pw-updated');
+  var msgEl = document.getElementById('pw-msg');
+  var msgTimer = null;
+
+  // textContent so a server error string can never inject markup.
+  function showMsg(s) {
+    if (!msgEl) return;
+    msgEl.textContent = s || '';
+    if (msgTimer) clearTimeout(msgTimer);
+    if (s) msgTimer = setTimeout(function () { msgEl.textContent = ''; }, 8000);
+  }
+
+  function errText(d, status) {
+    if (d && (d.error || d.detail || d.title)) return d.error || d.detail || d.title;
+    return 'HTTP ' + status;
+  }
+
+  function esc(s) {
+    var d = document.createElement('div');
+    d.textContent = (s == null ? '' : String(s));
+    // textContent->innerHTML escapes < > &; also escape quotes so the result is
+    // safe inside HTML attributes too.
+    return d.innerHTML.replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+  }
+
+  function rel(ts) {
+    if (!ts) return '';
+    var t = (typeof ts === 'string') ? Date.parse(ts) : ts * 1000;
+    if (isNaN(t)) return '';
+    var s = Math.max(0, Math.round((Date.now() - t) / 1000));
+    if (s < 60) return s + 's ago';
+    if (s < 3600) return Math.round(s / 60) + 'm ago';
+    return Math.round(s / 3600) + 'h ago';
+  }
+
+  function order(a, b) {
+    var rank = { ongoing: 0, preempted: 1, ended: 2 };
+    // `?? 9` not `|| 9`: ongoing ranks 0, which is falsy, so `|| 9` would push live
+    // activities to the BOTTOM, the inverse of the intended "active first".
+    return (rank[a.state] ?? 9) - (rank[b.state] ?? 9);
+  }
+
+  function render(items) {
+    if (!items.length) { box.innerHTML = '<p class="pw-empty">No Live Activities right now. They appear here while a parity check, appdata backup or mover runs.</p>'; return; }
+    items.sort(order);
+    var html = '';
+    items.forEach(function (a) {
+      var c = a.content || {};
+      var prog = (typeof c.progress === 'number') ? Math.round(c.progress * 100) : null;
+      html += '<div class="pw-card">';
+      html += '<div class="pw-head">';
+      html += '<span class="pw-name">' + esc(a.name || a.slug) + '</span>';
+      html += '<span class="pw-badge">' + esc(c.template || '') + '</span>';
+      html += '<span class="pw-badge pw-state-' + esc(a.state) + '">' + esc(a.state) + '</span>';
+      html += '</div>';
+      if (c.state) html += '<div>' + esc(c.state) + '</div>';
+      if (c.subtitle) html += '<div class="pw-sub">' + esc(c.subtitle) + '</div>';
+      if (prog !== null) html += '<div class="pw-bar"><span style="width:' + prog + '%"></span></div>';
+      if (Array.isArray(c.lines) && c.lines.length) {
+        html += '<div class="pw-lines">';
+        c.lines.forEach(function (ln) { html += '<div class="pw-lvl-' + esc(ln.level || 'info') + '">' + esc(ln.text) + '</div>'; });
+        html += '</div>';
+      }
+      html += '<div class="pw-sub">slug ' + esc(a.slug) + ' &middot; ' + rel(a.updated_at) + '</div>';
+      if (a.state === 'ongoing' || a.state === 'preempted') {
+        html += '<div class="pw-actions">';
+        html += '<button data-act="end" data-slug="' + esc(a.slug) + '">End</button>';
+        html += '<button data-act="cancel" data-slug="' + esc(a.slug) + '">Cancel (delete)</button>';
+        html += '</div>';
+      }
+      html += '</div>';
+    });
+    box.innerHTML = html;
+  }
+
+  function pwAct(action, slug) {
+    if (action === 'cancel' && !confirm('Delete activity "' + slug + '"? This removes it for all your devices.')) return;
+    var body = 'action=' + encodeURIComponent(action) + '&slug=' + encodeURIComponent(slug) + '&csrf_token=' + encodeURIComponent(CSRF);
+    fetch(API, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: body })
+      .then(function (r) {
+        return r.text().then(function (t) {
+          // Surface failures (403 missing/rotated CSRF or scope, 404, 5xx)
+          // instead of silently reloading so the action looks like a no-op.
+          if (!r.ok) {
+            var d = {}; try { d = JSON.parse(t); } catch (e) {}
+            showMsg((action === 'cancel' ? 'Cancel' : 'End') + ' failed: ' + errText(d, r.status));
+          } else {
+            showMsg('');
+          }
+          load();
+        });
+      })
+      .catch(function () { showMsg('Request failed: could not reach the plugin proxy.'); load(); });
+  }
+
+  // Delegated handler (no inline onclick) so a quote in a slug can't inject.
+  box.addEventListener('click', function (e) {
+    var btn = e.target.closest && e.target.closest('button[data-act]');
+    if (btn) pwAct(btn.getAttribute('data-act'), btn.getAttribute('data-slug'));
+  });
+
+  function load() {
+    fetch(API + '?action=list', { headers: { 'Accept': 'application/json' } })
+      .then(function (r) {
+        return r.text().then(function (t) {
+          var d = {}; try { d = JSON.parse(t); } catch (e) {}
+          // Don't let a 401/expired-key or proxy 502 fall through to an empty
+          // list, which renders a reassuring "nothing running" during an actual
+          // outage. Show the error instead.
+          if (!r.ok) {
+            box.innerHTML = '<p class="pw-warn">PushWard API error: ' + esc(errText(d, r.status)) +
+              '. Check the key and server URL in Settings &rarr; PushWard.</p>';
+            if (upd) upd.textContent = 'error ' + new Date().toLocaleTimeString();
+            return;
+          }
+          var items = d.items || d.activities || d.data || [];
+          render(items);
+          if (upd) upd.textContent = 'updated ' + new Date().toLocaleTimeString();
+        });
+      })
+      .catch(function () {
+        box.innerHTML = '<p class="pw-warn">Could not reach the PushWard API. Check the key and server URL in Settings &rarr; PushWard.</p>';
+      });
+  }
+
+  load();
+  setInterval(load, 5000);
+})();
+</script>
+<?PHP endif; ?>
