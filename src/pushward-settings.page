@@ -92,6 +92,12 @@ Track appdata backup:
 Track mover:
 : <select name="PUSHWARD_TRACK_MOVER"><?= pw_yesno($cfg,'PUSHWARD_TRACK_MOVER','true') ?></select>
 
+Track VM backup:
+: <select name="PUSHWARD_TRACK_VMBACKUP"><?= pw_yesno($cfg,'PUSHWARD_TRACK_VMBACKUP','true') ?></select>
+
+Track UPS on battery:
+: <select name="PUSHWARD_TRACK_UPS"><?= pw_yesno($cfg,'PUSHWARD_TRACK_UPS','true') ?></select>
+
 Poll interval (seconds):
 : <input type="number" name="PUSHWARD_POLL_INTERVAL" min="5" max="300" value="<?= pw_val($cfg,'PUSHWARD_POLL_INTERVAL','15') ?>">
 
@@ -132,7 +138,8 @@ function pwKeepKey() {
 > Notifications: Unraid calls the agent for any importance with the **Agent**
 > method enabled under Settings &rarr; Notifications (Warning and Alert by
 > default). Live Activities: a background monitor watches parity checks, appdata
-> backups and the mover and pushes progress to your phone. See the **Activities** tab.
+> backups, the mover, VM backups and the UPS, and pushes progress to your phone.
+> See the **Activities** tab.
 
 <?PHP if ($configured && $logTail): ?>
 

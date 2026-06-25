@@ -4,7 +4,7 @@
 set -euo pipefail
 SRC="$(cd "$(dirname "$0")/src" && pwd)"
 OUT="${1:-$(dirname "$0")/pushward-unraid.plg}"
-VERSION="2026.06.25c"
+VERSION="2026.06.25d"
 
 # Guard: a literal ]]> in any embedded TEXT file would break its CDATA section.
 # Skip *.png: the icon is base64-encoded (icon_file), never embedded raw, so a
@@ -75,6 +75,11 @@ cat <<XMLHEAD
 
 <CHANGES>
 ###$VERSION
+- Mover Live Activity now lists the files as they move (when Mover logging is enabled) with a progress percent sized from the cache-to-array shares' footprint on their assigned pool, plus bytes moved and transfer speed; shows a percent/bytes bar without the file list when Mover logging is off
+- Add VM Backup Live Activity (vmbackup plugin) with streaming log lines
+- Add UPS on-battery Live Activity: battery charge and runtime countdown (apcupsd)
+- Settings: new toggles for VM backup and UPS tracking
+###2026.06.25c
 - Move PushWard to the User Utilities row in Settings
 - Merge the Settings and Activities pages into one entry with two tabs
 - Use the PushWard icon instead of the generic bell
@@ -96,8 +101,9 @@ PushWard Unraid Plugin
 
 Forwards Unraid notifications to PushWard (https://pushward.app) as a native
 dynamix notification agent, and drives PushWard Live Activities for long-running
-operations (parity check/rebuild, appdata backup, mover) via a small background
-monitor. Find it under Settings -> User Utilities -> PushWard: configure your API
+operations (parity check/rebuild, appdata backup, mover, VM backup, UPS on
+battery) via a small background monitor. Find it under Settings -> User Utilities
+-> PushWard: configure your API
 key on the Settings tab and view Live Activities on the Activities tab.
 
 Plugin: https://github.com/mac-lucky/pushward-unraid-plugin

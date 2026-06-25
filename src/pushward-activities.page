@@ -97,7 +97,7 @@ if (preg_match('/^csrf_token="?([^"\n]*)"?/m', (string) @file_get_contents('/var
   }
 
   function render(items) {
-    if (!items.length) { box.innerHTML = '<p class="pw-empty">No Live Activities right now. They appear here while a parity check, appdata backup or mover runs.</p>'; return; }
+    if (!items.length) { box.innerHTML = '<p class="pw-empty">No Live Activities right now. They appear here while a parity check, appdata backup, mover, VM backup or UPS event runs.</p>'; return; }
     items.sort(order);
     var html = '';
     items.forEach(function (a) {
