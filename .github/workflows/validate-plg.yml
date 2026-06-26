@@ -8,11 +8,19 @@ on:
     paths: ['pushward-unraid.plg', 'src/**', 'build-plg.sh', '.github/workflows/validate-plg.yml']
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
 jobs:
   validate:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Check pushward-unraid.plg is in sync with src/
         run: |
@@ -55,8 +63,26 @@ jobs:
             echo "== php -l $f =="
             php -l "/tmp/plg/$f"
           done
+
+          # Exercise the pure steps-index math (the 1-based -> 0-based, clamped
+          # conversion the steps template relies on). PUSHWARD_NO_MAIN lets us
+          # require the daemon without starting its loop.
+          echo "== steps_index assertions =="
+          php -r 'define("PUSHWARD_NO_MAIN", 1); require "/tmp/plg/pushward-monitor.php";
+            foreach ([[0,5,0],[1,5,0],[5,5,4],[3,5,2],[9,5,4],[0,0,0],[1,1,0]] as [$i,$t,$w]) {
+              $g = steps_index($i, $t);
+              if ($g !== $w) { fwrite(STDERR, "steps_index($i,$t)=$g want $w\n"); exit(1); }
+            }
+            echo "steps_index ok\n";'
           for p in pushward-settings.page pushward-activities.page; do
             echo "== php -l $p (body) =="
             awk 'f{print} /^---$/{f=1}' "/tmp/plg/$p" > "/tmp/plg/$p.body.php"
             php -l "/tmp/plg/$p.body.php"
+          done
+
+          # Embedded page JS is not covered by php -l; syntax-check each <script>.
+          for p in pushward-settings.page pushward-activities.page; do
+            echo "== node --check $p (js) =="
+            perl -0777 -ne 'print $1 while /<script[^>]*>(.*?)<\/script>/sg' "/tmp/plg/$p" > "/tmp/plg/$p.js"
+            node --check "/tmp/plg/$p.js"
           done

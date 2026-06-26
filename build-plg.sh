@@ -4,7 +4,7 @@
 set -euo pipefail
 SRC="$(cd "$(dirname "$0")/src" && pwd)"
 OUT="${1:-$(dirname "$0")/pushward-unraid.plg}"
-VERSION="2026.06.25d"
+VERSION="2026.06.26"
 
 # Guard: a literal ]]> in any embedded TEXT file would break its CDATA section.
 # Skip *.png: the icon is base64-encoded (icon_file), never embedded raw, so a
@@ -75,6 +75,10 @@ cat <<XMLHEAD
 
 <CHANGES>
 ###$VERSION
+- Appdata and VM backup Live Activities now use the steps template, one step per container or VM; the mover keeps the streaming log view
+- Refresh the Activities dashboard: per-activity icons, accent colors matching the phone, pill status badges with a live indicator, a percent label and an animated bar for jobs without a percentage
+- Refresh the Settings page: a header, status cards for the key, subscription, API and monitor, plus a tidier help note and monitor log
+###2026.06.25d
 - Mover Live Activity now lists the files as they move (when Mover logging is enabled) with a progress percent sized from the cache-to-array shares' footprint on their assigned pool, plus bytes moved and transfer speed; shows a percent/bytes bar without the file list when Mover logging is off
 - Add VM Backup Live Activity (vmbackup plugin) with streaming log lines
 - Add UPS on-battery Live Activity: battery charge and runtime countdown (apcupsd)

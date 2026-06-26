@@ -6,10 +6,11 @@
  * Polls Unraid for long-running operations and drives PushWard Live Activities
  * over the public REST API:
  *   - parity check / rebuild / clear  -> "generic" template (progress + ETA)
- *   - appdata backup (CA appdata.backup) -> "log" template (streaming log lines)
+ *   - appdata backup (CA appdata.backup) -> "steps" template (one step per container)
  *   - mover (cache -> array)          -> "log" template (files moved + percent),
  *                                        "generic" (percent/bytes) when mover logging is off
- *   - VM backup (vmbackup plugin)     -> "log" template (streaming log lines)
+ *   - VM backup (vmbackup plugin)     -> "steps" template (one step per VM),
+ *                                        "generic" (indeterminate) when the plan is "all"
  *   - UPS on battery (apcupsd)        -> "generic" template (charge + runtime countdown)
  *
  * Single long-running process, supervised by watchdog.sh (flock + pgrep) and a
@@ -195,6 +196,14 @@ function human_bytes(float $b): string {
     $i = max(0, min($i, count($units) - 1));
     $v = $b / pow(1024, $i);
     return ($i === 0 || $v >= 100 ? (string) round($v) : (string) round($v, 1)) . ' ' . $units[$i];
+}
+
+/**
+ * 0-based index of the step currently in progress, from a 1-based count of
+ * items finished/seen so far. Clamped into [0, total-1] for the steps template.
+ */
+function steps_index(int $idx, int $total): int {
+    return max(0, min($idx - 1, max(1, $total) - 1));
 }
 
 function map_level(string $raw): string {
@@ -484,40 +493,6 @@ function backup_progress(string $logPath): array {
     ];
 }
 
-/** The newest $n log lines as PushWard LogLine objects, newest-first. */
-function backup_log_lines(string $logPath, int $n): array {
-    $content = (string) @file_get_contents($logPath);
-    $raw = array_values(array_filter(
-        preg_split('/\r?\n/', $content) ?: [],
-        fn($l) => trim($l) !== ''
-    ));
-    $tail = array_slice($raw, -$n);
-    $out = [];
-    foreach ($tail as $l) {
-        $p = parse_backup_line($l);
-        if ($p === null) {
-            continue;
-        }
-        $text = ($p['comp'] !== '' && $p['comp'] !== 'Main') ? $p['comp'] . ': ' . $p['msg'] : $p['msg'];
-        $text = mb_substr($text, 0, 512);
-        if ($text === '') {
-            continue;
-        }
-        $line = ['text' => $text, 'level' => $p['level']];
-        if ($p['at'] !== null) {
-            $line['at'] = $p['at'];
-        }
-        $out[] = $line;
-    }
-    return array_reverse($out); // newest-first
-}
-
-/** Size of ab.log, to detect new content cheaply for the throttle. */
-function backup_log_size(string $logPath): int {
-    $s = @filesize($logPath);
-    return $s === false ? 0 : (int) $s;
-}
-
 // ---------------------------------------------------------------------------
 // Detection: VM backup (JTok vmbackup plugin)
 // ---------------------------------------------------------------------------
@@ -643,31 +618,6 @@ function vmbackup_progress(string $logPath): array {
     ];
 }
 
-/** The newest $n vmbackup log lines as PushWard LogLine objects, newest-first. */
-function vmbackup_log_lines(string $logPath, int $n): array {
-    $raw = array_values(array_filter(
-        preg_split('/\r?\n/', (string) @file_get_contents($logPath)) ?: [],
-        fn($l) => trim($l) !== ''
-    ));
-    $out = [];
-    foreach (array_slice($raw, -$n) as $l) {
-        $p = parse_vmbackup_line($l);
-        if ($p === null) {
-            continue;
-        }
-        $text = mb_substr($p['msg'], 0, 512);
-        if ($text === '') {
-            continue;
-        }
-        $line = ['text' => $text, 'level' => $p['level']];
-        if ($p['at'] !== null) {
-            $line['at'] = $p['at'];
-        }
-        $out[] = $line;
-    }
-    return array_reverse($out);
-}
-
 // ---------------------------------------------------------------------------
 // Detection: UPS on battery (apcupsd)
 // ---------------------------------------------------------------------------
@@ -762,7 +712,7 @@ function drive_activity(array $cfg, string $slug, string $name, ?array $content,
                 mlog("seed $slug failed: {$p['code']} {$p['body']}", 'error');
                 return;
             }
-            // Merge (don't replace) so end_content / log_size / pos bookkeeping
+            // Merge (don't replace) so end_content / log_path / pos bookkeeping
             // the caller stashed on $st survives the start transition.
             $st['active']          = true;
             $st['last_push_ts']    = $now;
@@ -875,41 +825,42 @@ function tick_backup(array $cfg, string $prefix, array &$state): void {
     $st   = $state[$slug] ?? [];
     $log  = BACKUP_TMP . '/ab.log';
 
-    if ($cfg['backup'] && backup_running()) {
-        $bp   = backup_progress($log);
-        $size = backup_log_size($log);
-        $newContent = $size !== (int) ($st['log_size'] ?? -1);
-        $st['log_size'] = $size;
+    $bp = ($cfg['backup'] && backup_running()) ? backup_progress($log) : null;
+    // Wait for the container count (the "Selected containers" line, which the CA
+    // plugin logs before any container runs) before opening the activity, so
+    // total_steps is the real total from the first frame rather than resizing
+    // from a 1-step placeholder.
+    if ($bp !== null && $bp['total'] > 0) {
+        $total = (int) $bp['total'];
+        $step  = steps_index((int) $bp['idx'], $total);
 
         $stateText = $bp['current'] !== ''
-            ? sprintf('Backing up %s (%d/%d)', $bp['current'], $bp['idx'], $bp['total'])
+            ? sprintf('Backing up %s (%d/%d)', $bp['current'], $bp['idx'], $total)
             : 'Starting appdata backup...';
         $content = [
-            'template'     => 'log',
+            'template'     => 'steps',
             'progress'     => round($bp['progress'], 4),
+            'current_step' => $step,
+            'total_steps'  => $total,
             'state'        => $stateText,
             'icon'         => 'externaldrive.badge.timemachine',
             'accent_color' => $bp['error'] ? 'orange' : 'blue',
-            'lines'        => backup_log_lines($log, 10),
         ];
         $st['end_content'] = [
-            'template'     => 'log',
+            'template'     => 'steps',
             'progress'     => 1.0,
+            'current_step' => $total - 1,
+            'total_steps'  => $total,
             'state'        => $bp['error'] ? 'Backup finished with errors' : 'Backup complete',
             'icon'         => $bp['error'] ? 'exclamationmark.triangle.fill' : 'checkmark.circle.fill',
             'accent_color' => $bp['error'] ? 'red' : 'green',
-            'lines'        => backup_log_lines($log, 10),
         ];
-        drive_activity($cfg, $slug, 'Unraid · ' . $cfg['server'] . ' appdata backup', $content, $bp['progress'], $stateText, $newContent, $st);
+        // Progress moves ~1/total per container and the state text changes each
+        // time, so drive_activity's progress/state throttle pushes once per
+        // container; no per-log-line change flag needed.
+        drive_activity($cfg, $slug, 'Unraid · ' . $cfg['server'] . ' appdata backup', $content, $bp['progress'], $stateText, false, $st);
     } else {
-        if (!empty($st['active']) && !empty($st['end_content'])) {
-            // refresh the final frame with the last lines of the completed run
-            $st['end_content']['lines'] = backup_log_lines($log, 10);
-        }
         drive_activity($cfg, $slug, '', null, 1.0, '', false, $st);
-        if (empty($st['active'])) {
-            unset($st['log_size']);
-        }
     }
     $state[$slug] = $st;
 }
@@ -1048,16 +999,13 @@ function tick_vmbackup(array $cfg, string $prefix, array &$state): void {
             ? $st['log_path']        // stay on the log we latched for this run
             : vmbackup_fresh_log();  // starting: ignore a stale previous-run log
     }
-    $lines = $log !== '' ? vmbackup_log_lines($log, 10) : [];
+    $bp = $log !== '' ? vmbackup_progress($log) : null;
 
-    // Only drive a 'log' activity once at least one line has parsed: the released
-    // log template is never sent an empty-lines frame, and the push-to-start
-    // frame can't show the previous run's parsed state.
-    if ($log !== '' && $lines) {
-        $bp   = vmbackup_progress($log);
-        $size = backup_log_size($log);
-        $newContent = $size !== (int) ($st['log_size'] ?? -1);
-        $st['log_size'] = $size;
+    // Open the activity once the run has produced identifiable output (a VM is
+    // being processed, one completed, or it errored) so the first frame reflects
+    // this run, not the previous one. vmbackup_progress already parsed the whole
+    // log, so derive the gate from it instead of reading the log a second time.
+    if ($bp !== null && ($bp['current'] !== '' || $bp['idx'] > 0 || $bp['error'])) {
         $st['log_path'] = $log;
 
         if ($bp['current'] === '') {
@@ -1067,35 +1015,54 @@ function tick_vmbackup(array $cfg, string $prefix, array &$state): void {
         } else {
             $stateText = sprintf('Backing up %s', $bp['current']);
         }
-        $content = [
-            'template'     => 'log',
-            'state'        => $stateText,
-            'icon'         => 'desktopcomputer',
-            'accent_color' => $bp['error'] ? 'orange' : 'blue',
-            'lines'        => $lines,
-        ];
-        $st['end_content'] = [
-            'template'     => 'log',
-            'state'        => $bp['error'] ? 'VM backup finished with errors' : 'VM backup complete',
-            'icon'         => $bp['error'] ? 'exclamationmark.triangle.fill' : 'checkmark.circle.fill',
-            'accent_color' => $bp['error'] ? 'red' : 'green',
-            'lines'        => $lines,
-        ];
-        // Only carry a progress bar when the planned VM count is known; otherwise
-        // leave it off (indeterminate) rather than show a bouncing fraction.
-        if ($bp['progress'] !== null) {
-            $content['progress']           = round($bp['progress'], 4);
-            $st['end_content']['progress'] = 1.0;
+
+        $endState = $bp['error'] ? 'VM backup finished with errors' : 'VM backup complete';
+        $endIcon  = $bp['error'] ? 'exclamationmark.triangle.fill' : 'checkmark.circle.fill';
+        $endColor = $bp['error'] ? 'red' : 'green';
+        if ($bp['total'] > 0) {
+            // Known plan: one step per VM.
+            $total = (int) $bp['total'];
+            $step  = steps_index((int) $bp['idx'], $total);
+            $content = [
+                'template'     => 'steps',
+                'progress'     => round((float) $bp['progress'], 4),
+                'current_step' => $step,
+                'total_steps'  => $total,
+                'state'        => $stateText,
+                'icon'         => 'desktopcomputer',
+                'accent_color' => $bp['error'] ? 'orange' : 'blue',
+            ];
+            $st['end_content'] = [
+                'template'     => 'steps',
+                'progress'     => 1.0,
+                'current_step' => $total - 1,
+                'total_steps'  => $total,
+                'state'        => $endState,
+                'icon'         => $endIcon,
+                'accent_color' => $endColor,
+            ];
+        } else {
+            // Plan is "all"/unknown: steps needs a fixed total, so fall back to a
+            // generic indeterminate frame rather than a bouncing fraction.
+            $content = [
+                'template'     => 'generic',
+                'state'        => $stateText,
+                'icon'         => 'desktopcomputer',
+                'accent_color' => $bp['error'] ? 'orange' : 'blue',
+            ];
+            $st['end_content'] = [
+                'template'     => 'generic',
+                'progress'     => 1.0,
+                'state'        => $endState,
+                'icon'         => $endIcon,
+                'accent_color' => $endColor,
+            ];
         }
-        drive_activity($cfg, $slug, 'Unraid · ' . $cfg['server'] . ' VM backup', $content, $bp['progress'] ?? 0.0, $stateText, $newContent, $st);
+        drive_activity($cfg, $slug, 'Unraid · ' . $cfg['server'] . ' VM backup', $content, $bp['progress'] ?? 0.0, $stateText, false, $st);
     } else {
-        if (!empty($st['active']) && !empty($st['end_content']) && !empty($st['log_path']) && is_file($st['log_path'])) {
-            // refresh the final frame with the last lines of the completed run
-            $st['end_content']['lines'] = vmbackup_log_lines($st['log_path'], 10);
-        }
         drive_activity($cfg, $slug, '', null, 1.0, '', false, $st);
         if (empty($st['active'])) {
-            unset($st['log_size'], $st['log_path']);
+            unset($st['log_path']);
         }
     }
     $state[$slug] = $st;
