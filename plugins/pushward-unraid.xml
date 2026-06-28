@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Plugin>
+  <Name>PushWard</Name>
+  <PluginURL>https://github.com/mac-lucky/pushward-unraid-plugin/raw/main/pushward-unraid.plg</PluginURL>
+  <PluginAuthor>mac-lucky</PluginAuthor>
+  <Overview>Forward every Unraid notification to your iPhone and show Live Activities for parity check/rebuild, appdata backup, mover, VM backup, and UPS on battery. Self-contained: no downloaded binary and no Unraid API key. Needs the PushWard iOS app with an API key.</Overview>
+  <Support>https://github.com/mac-lucky/pushward-unraid-plugin/issues</Support>
+  <Project>https://github.com/mac-lucky/pushward-unraid-plugin</Project>
+  <Icon>https://raw.githubusercontent.com/mac-lucky/pushward-unraid-plugin/main/src/pushward.png</Icon>
+  <Category>Tools:Utilities</Category>
+  <License>MIT</License>
+  <MinVer>6.12</MinVer>
+</Plugin>
