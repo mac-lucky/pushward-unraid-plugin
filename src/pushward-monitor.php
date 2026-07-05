@@ -618,6 +618,53 @@ function vmbackup_progress(string $logPath): array {
     ];
 }
 
+/**
+ * Total bytes of a VM's disk images from its libvirt domain XML. Only
+ * device='disk' sources count (an attached install ISO is device='cdrom' and is
+ * not part of the backup). Returns 0.0 when virsh is missing or the domain has
+ * no file-backed disk, so the caller can substitute a positive weight.
+ */
+function vm_vdisk_bytes(string $vm): float {
+    @exec('virsh dumpxml ' . escapeshellarg($vm) . ' 2>/dev/null', $out, $rc);
+    if ($rc !== 0 || !$out) {
+        return 0.0;
+    }
+    $xml   = implode("\n", $out);
+    $bytes = 0.0;
+    if (preg_match_all('/<disk\b[^>]*device=[\'"]disk[\'"][^>]*>(.*?)<\/disk>/is', $xml, $blocks)) {
+        foreach ($blocks[1] as $block) {
+            if (preg_match('/<source\b[^>]*\bfile=[\'"]([^\'"]+)[\'"]/i', $block, $m)) {
+                $size = @filesize($m[1]);
+                if ($size !== false) {
+                    $bytes += (float) $size;
+                }
+            }
+        }
+    }
+    return $bytes;
+}
+
+/**
+ * One positive weight per planned VM, in vms_to_backup order, so the steps row
+ * can size each VM by how much data it copies instead of equal widths. Order and
+ * count mirror vmbackup_planned_total() (same config list); a VM whose disks
+ * can't be sized falls back to 1.0 so no segment is zero-width. Statting the
+ * images is cheap here: the run already holds the source disks spun up.
+ */
+function vmbackup_step_weights(): array {
+    $c    = @parse_ini_file(VMBACKUP_CFG) ?: [];
+    $list = trim($c['vms_to_backup'] ?? '');
+    if ($list === '') {
+        return [];
+    }
+    $vms     = array_filter(array_map('trim', explode(',', $list)), fn($v) => $v !== '');
+    $weights = [];
+    foreach ($vms as $vm) {
+        $weights[] = vm_vdisk_bytes($vm) ?: 1.0;
+    }
+    return $weights;
+}
+
 // ---------------------------------------------------------------------------
 // Detection: UPS on battery (apcupsd)
 // ---------------------------------------------------------------------------
@@ -801,6 +848,10 @@ function tick_parity(array $cfg, string $prefix, array $md, array &$state): void
         ];
         if ($eta > 0) {
             $content['remaining_time'] = $eta;
+            // Hand iOS the finish time so it interpolates the bar and counts the
+            // ETA down between pushes (generic-only; end_date must be in future).
+            $content['live_progress'] = true;
+            $content['end_date']      = $now + $eta;
         }
         $st['end_content'] = [
             'template'     => 'generic',
@@ -1020,9 +1071,16 @@ function tick_vmbackup(array $cfg, string $prefix, array &$state): void {
         $endIcon  = $bp['error'] ? 'exclamationmark.triangle.fill' : 'checkmark.circle.fill';
         $endColor = $bp['error'] ? 'red' : 'green';
         if ($bp['total'] > 0) {
-            // Known plan: one step per VM.
+            // Known plan: one step per VM, each sized by its vdisk bytes so the
+            // segmented row is proportional to the work rather than equal-width.
             $total = (int) $bp['total'];
             $step  = steps_index((int) $bp['idx'], $total);
+            if (!isset($st['step_weights'])) {
+                $st['step_weights'] = vmbackup_step_weights(); // one-shot per run
+            }
+            // Only attach when the count matches (a mid-run config edit could
+            // desync it); a length mismatch is a 400 on the steps template.
+            $weights = count($st['step_weights']) === $total ? $st['step_weights'] : null;
             $content = [
                 'template'     => 'steps',
                 'progress'     => round((float) $bp['progress'], 4),
@@ -1041,6 +1099,10 @@ function tick_vmbackup(array $cfg, string $prefix, array &$state): void {
                 'icon'         => $endIcon,
                 'accent_color' => $endColor,
             ];
+            if ($weights !== null) {
+                $content['step_weights']           = $weights;
+                $st['end_content']['step_weights'] = $weights;
+            }
         } else {
             // Plan is "all"/unknown: steps needs a fixed total, so fall back to a
             // generic indeterminate frame rather than a bouncing fraction.
@@ -1062,7 +1124,7 @@ function tick_vmbackup(array $cfg, string $prefix, array &$state): void {
     } else {
         drive_activity($cfg, $slug, '', null, 1.0, '', false, $st);
         if (empty($st['active'])) {
-            unset($st['log_path']);
+            unset($st['log_path'], $st['step_weights']);
         }
     }
     $state[$slug] = $st;

@@ -4,7 +4,7 @@
 set -euo pipefail
 SRC="$(cd "$(dirname "$0")/src" && pwd)"
 OUT="${1:-$(dirname "$0")/pushward-unraid.plg}"
-VERSION="2026.06.26"
+VERSION="2026.07.05"
 
 # Guard: a literal ]]> in any embedded TEXT file would break its CDATA section.
 # Skip *.png: the icon is base64-encoded (icon_file), never embedded raw, so a
@@ -75,6 +75,9 @@ cat <<XMLHEAD
 
 <CHANGES>
 ###$VERSION
+- Parity check Live Activity now shows a smooth progress bar and a self-counting ETA that keeps moving between updates
+- VM backup steps are now sized to each VM's disk footprint, so the bar reflects how much data each one copies
+###2026.06.26
 - Appdata and VM backup Live Activities now use the steps template, one step per container or VM; the mover keeps the streaming log view
 - Refresh the Activities dashboard: per-activity icons, accent colors matching the phone, pill status badges with a live indicator, a percent label and an animated bar for jobs without a percentage
 - Refresh the Settings page: a header, status cards for the key, subscription, API and monitor, plus a tidier help note and monitor log
