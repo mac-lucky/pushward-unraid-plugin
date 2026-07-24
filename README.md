@@ -58,9 +58,9 @@ A background monitor, started by an array-event hook and kept alive by a 1-minut
 | Operation | Source | Template | Shows |
 |---|---|---|---|
 | Parity check / rebuild / clear | `mdcmd status` | generic | percent, speed, ETA, error count |
-| Appdata backup | `appdata.backup` log + state file | log | live log lines + container progress |
+| Appdata backup | `appdata.backup` log + state file | steps | per-container step progress |
 | Mover | mover flag + syslog move log + cache usage | log | files moved, percent, transfer speed |
-| VM backup | `vmbackup` plugin log | log | live log lines + per-VM progress |
+| VM backup | `vmbackup` plugin log | steps | per-VM step progress |
 | UPS on battery | `apcaccess` (apcupsd) | generic | battery charge + runtime countdown |
 
 Activities appear via push-to-start (no app interaction needed), update as the job runs, and end automatically when it finishes. View and end the current ones on the Activities tab of Settings > PushWard.
