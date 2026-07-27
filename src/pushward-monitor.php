@@ -43,6 +43,8 @@ const VMBACKUP_FRESH_SECS  = 600; // a vmbackup log older than this is a previou
 const UPS_ONBATT_DEBOUNCE  = 2;   // consecutive on-battery polls before raising the outage activity
 const MOVER_MIN_MOVABLE    = 1073741824; // 1 GiB: below this, skip the % and show indeterminate
 const MOVER_DU_BUDGET      = 25;  // seconds budget for the one-shot movable-size baseline du
+const PARITY_ETA_MAX_SECS  = 2592000; // 30 days: a longer ETA is a bad speed sample, not a forecast
+const VIRSH_TIMEOUT_SECS   = 5;   // cap a dumpxml against an unresponsive libvirtd
 
 // ---------------------------------------------------------------------------
 // Config
@@ -199,11 +201,12 @@ function human_bytes(float $b): string {
 }
 
 /**
- * 0-based index of the step currently in progress, from a 1-based count of
- * items finished/seen so far. Clamped into [0, total-1] for the steps template.
+ * Number of the step currently running, for the steps template. Steps count
+ * from 1, with 0 meaning "not started" and $total meaning "all done", so the
+ * caller passes how many steps have STARTED, not an array index.
  */
-function steps_index(int $idx, int $total): int {
-    return max(0, min($idx - 1, max(1, $total) - 1));
+function steps_current(int $started, int $total): int {
+    return max(0, min($started, max(1, $total)));
 }
 
 function map_level(string $raw): string {
@@ -543,14 +546,18 @@ function vmbackup_fresh_log(): string {
     return (time() - (@filemtime($log) ?: 0)) <= VMBACKUP_FRESH_SECS ? $log : '';
 }
 
-/** VMs the run plans to back up, from config; 0 when unknown ("all"/unset). */
-function vmbackup_planned_total(): int {
+/**
+ * VMs the run plans to back up, in config order; empty when the plan is "all"
+ * or unset. The step number and the per-step weights are both derived from this
+ * one list so they cannot drift apart mid-run.
+ */
+function vmbackup_planned_vms(): array {
     $c    = @parse_ini_file(VMBACKUP_CFG) ?: [];
     $list = trim($c['vms_to_backup'] ?? '');
     if ($list === '') {
-        return 0;
+        return [];
     }
-    return count(array_filter(array_map('trim', explode(',', $list)), fn($v) => $v !== ''));
+    return array_values(array_filter(array_map('trim', explode(',', $list)), fn($v) => $v !== ''));
 }
 
 /** Parse a vmbackup log line: "YYYY-mm-dd HH:ii:ss <level>: <message>". */
@@ -607,11 +614,20 @@ function vmbackup_progress(string $logPath): array {
             $error = true;
         }
     }
-    $total = vmbackup_planned_total();
+    $vms   = vmbackup_planned_vms();
+    $total = count($vms);
     $d     = count($done);
+    // Take the step from the running VM's position in the planned list, not
+    // from a count of completions: vmbackup logs "can not be found" and moves
+    // on without a "completed." line, and after one such skip a count points at
+    // the wrong VM - and at the wrong step_weights entry - for the rest of the
+    // run. Fall back to the count only while no VM is identifiable.
+    $pos  = $current !== '' ? array_search($current, $vms, true) : false;
+    $step = $pos !== false ? $pos + 1 : (($current !== '' || $d > 0) ? $d + 1 : 0);
     return [
         'total'    => $total,
-        'idx'      => $total > 0 ? min($d, $total) : $d,
+        'done'     => $d,
+        'step'     => $total > 0 ? min($step, $total) : $step,
         'current'  => $current,
         'progress' => $total > 0 ? min(1.0, $d / $total) : null,
         'error'    => $error,
@@ -619,13 +635,34 @@ function vmbackup_progress(string $logPath): array {
 }
 
 /**
+ * Bytes a disk image actually occupies. Unraid creates raw vdisks sparse, so
+ * the apparent size is the provisioned size - a 200 GiB image holding 12 GiB
+ * reports 200 GiB - and weighting by that sizes the segment by provisioning
+ * instead of by the data the backup copies. Prefer the allocated block count
+ * and fall back to the apparent size only where blocks are unavailable.
+ */
+function vdisk_alloc_bytes(string $path): float {
+    $s = @stat($path);
+    if ($s === false) {
+        return 0.0;
+    }
+    if (!empty($s['blocks']) && $s['blocks'] > 0) {
+        return (float) $s['blocks'] * 512;
+    }
+    return (float) ($s['size'] ?? 0);
+}
+
+/**
  * Total bytes of a VM's disk images from its libvirt domain XML. Only
  * device='disk' sources count (an attached install ISO is device='cdrom' and is
  * not part of the backup). Returns 0.0 when virsh is missing or the domain has
- * no file-backed disk, so the caller can substitute a positive weight.
+ * no file-backed disk, so the caller can substitute a weight.
  */
 function vm_vdisk_bytes(string $vm): float {
-    @exec('virsh dumpxml ' . escapeshellarg($vm) . ' 2>/dev/null', $out, $rc);
+    // Timeout: libvirtd goes unresponsive under heavy VM I/O, which is exactly
+    // what a backup run produces. An untimed exec would block the poll loop
+    // once per VM while the watchdog still sees a live process and leaves it be.
+    @exec('timeout ' . VIRSH_TIMEOUT_SECS . ' virsh dumpxml ' . escapeshellarg($vm) . ' 2>/dev/null', $out, $rc);
     if ($rc !== 0 || !$out) {
         return 0.0;
     }
@@ -634,10 +671,7 @@ function vm_vdisk_bytes(string $vm): float {
     if (preg_match_all('/<disk\b[^>]*device=[\'"]disk[\'"][^>]*>(.*?)<\/disk>/is', $xml, $blocks)) {
         foreach ($blocks[1] as $block) {
             if (preg_match('/<source\b[^>]*\bfile=[\'"]([^\'"]+)[\'"]/i', $block, $m)) {
-                $size = @filesize($m[1]);
-                if ($size !== false) {
-                    $bytes += (float) $size;
-                }
+                $bytes += vdisk_alloc_bytes($m[1]);
             }
         }
     }
@@ -645,24 +679,31 @@ function vm_vdisk_bytes(string $vm): float {
 }
 
 /**
- * One positive weight per planned VM, in vms_to_backup order, so the steps row
- * can size each VM by how much data it copies instead of equal widths. Order and
- * count mirror vmbackup_planned_total() (same config list); a VM whose disks
- * can't be sized falls back to 1.0 so no segment is zero-width. Statting the
- * images is cheap here: the run already holds the source disks spun up.
+ * One positive weight per planned VM, in vmbackup_planned_vms() order, so the
+ * steps row can size each VM by how much data it copies instead of equal
+ * widths. Statting the images is cheap here: the run already holds the source
+ * disks spun up. Returns [] when nothing could be sized, which leaves the row
+ * at equal widths rather than inventing a shape.
  */
 function vmbackup_step_weights(): array {
-    $c    = @parse_ini_file(VMBACKUP_CFG) ?: [];
-    $list = trim($c['vms_to_backup'] ?? '');
-    if ($list === '') {
+    $vms = vmbackup_planned_vms();
+    if (!$vms) {
         return [];
     }
-    $vms     = array_filter(array_map('trim', explode(',', $list)), fn($v) => $v !== '');
     $weights = [];
     foreach ($vms as $vm) {
-        $weights[] = vm_vdisk_bytes($vm) ?: 1.0;
+        $weights[] = vm_vdisk_bytes($vm);
     }
-    return $weights;
+    $sized = array_filter($weights, fn($w) => $w > 0);
+    if (!$sized) {
+        return [];
+    }
+    // A VM we could not size takes the mean of the ones we could. The weights
+    // are byte counts, so a literal 1.0 here is a weight of one byte: next to a
+    // 500 GB vdisk that segment renders zero pixels wide, the opposite of the
+    // fallback's purpose.
+    $mean = array_sum($sized) / count($sized);
+    return array_map(fn($w) => $w > 0 ? $w : $mean, $weights);
 }
 
 // ---------------------------------------------------------------------------
@@ -826,12 +867,24 @@ function tick_parity(array $cfg, string $prefix, array $md, array &$state): void
         $st['last_pos_ts'] = $now;
         $speed = (float) ($st['last_speed'] ?? 0);
 
-        $pct       = round($p['progress'] * 100);
-        $stateText = sprintf('%s · %d%%', $p['label'], $pct);
-        $subParts  = [];
-        if ($eta > 0) {
-            $subParts[] = 'ETA ' . human_eta($eta);
+        // One poll's speed sample extrapolates absurdly while the check stalls
+        // (bad-sector retries, mover contention). Past the ceiling, treat it as
+        // no estimate at all: an end_date beyond five years is rejected, which
+        // would fail the whole update instead of just the ETA.
+        if ($eta > PARITY_ETA_MAX_SECS) {
+            $eta = 0;
         }
+        $live = $eta > 0;
+
+        // Under live_progress the phone counts the ETA down in the headline slot
+        // and drops the caption timer, so a pushed percent and a frozen ETA
+        // would sit there disagreeing with the moving bar between pushes.
+        $stateText = $live
+            ? $p['label']
+            : sprintf('%s · %d%%', $p['label'], round($p['progress'] * 100));
+        // No static "ETA 2h15m" caption: it only ever had a value when $live is
+        // on, and that is precisely when the phone renders a live countdown.
+        $subParts = [];
         if ($speed > 0) {
             $subParts[] = human_speed($speed);
         }
@@ -846,12 +899,19 @@ function tick_parity(array $cfg, string $prefix, array $md, array &$state): void
             'icon'         => $p['icon'],
             'accent_color' => $p['corr'] > 0 ? 'orange' : 'blue',
         ];
-        if ($eta > 0) {
+        if ($live) {
             $content['remaining_time'] = $eta;
             // Hand iOS the finish time so it interpolates the bar and counts the
             // ETA down between pushes (generic-only; end_date must be in future).
             $content['live_progress'] = true;
             $content['end_date']      = $now + $eta;
+        } else {
+            // content is an RFC 7396 merge patch, so omitting these keeps the
+            // last anchor and a stalled check would keep animating toward a
+            // finish time that no longer applies. null is the documented clear.
+            $content['remaining_time'] = null;
+            $content['live_progress']  = false;
+            $content['end_date']       = null;
         }
         $st['end_content'] = [
             'template'     => 'generic',
@@ -860,6 +920,12 @@ function tick_parity(array $cfg, string $prefix, array $md, array &$state): void
             'subtitle'     => $p['corr'] > 0 ? $p['corr'] . ' errors found' : 'No errors',
             'icon'         => $p['corr'] > 0 ? 'exclamationmark.triangle.fill' : 'checkmark.circle.fill',
             'accent_color' => $p['corr'] > 0 ? 'red' : 'green',
+            // The final frame is a merge patch too. A check that beats its ETA
+            // would otherwise end with the anchor still in the future, and the
+            // finished card would count down instead of reading 100%.
+            'remaining_time' => null,
+            'live_progress'  => false,
+            'end_date'       => null,
         ];
         drive_activity($cfg, $slug, 'Unraid · ' . $cfg['server'] . ' array', $content, $p['progress'], $stateText, false, $st);
     } else {
@@ -883,7 +949,9 @@ function tick_backup(array $cfg, string $prefix, array &$state): void {
     // from a 1-step placeholder.
     if ($bp !== null && $bp['total'] > 0) {
         $total = (int) $bp['total'];
-        $step  = steps_index((int) $bp['idx'], $total);
+        // idx already counts the container being backed up right now, so it is
+        // the 1-based step number the API and the phone expect.
+        $step = steps_current((int) $bp['idx'], $total);
 
         $stateText = $bp['current'] !== ''
             ? sprintf('Backing up %s (%d/%d)', $bp['current'], $bp['idx'], $total)
@@ -900,7 +968,7 @@ function tick_backup(array $cfg, string $prefix, array &$state): void {
         $st['end_content'] = [
             'template'     => 'steps',
             'progress'     => 1.0,
-            'current_step' => $total - 1,
+            'current_step' => $total,
             'total_steps'  => $total,
             'state'        => $bp['error'] ? 'Backup finished with errors' : 'Backup complete',
             'icon'         => $bp['error'] ? 'exclamationmark.triangle.fill' : 'checkmark.circle.fill',
@@ -1056,13 +1124,13 @@ function tick_vmbackup(array $cfg, string $prefix, array &$state): void {
     // being processed, one completed, or it errored) so the first frame reflects
     // this run, not the previous one. vmbackup_progress already parsed the whole
     // log, so derive the gate from it instead of reading the log a second time.
-    if ($bp !== null && ($bp['current'] !== '' || $bp['idx'] > 0 || $bp['error'])) {
+    if ($bp !== null && ($bp['current'] !== '' || $bp['done'] > 0 || $bp['error'])) {
         $st['log_path'] = $log;
 
         if ($bp['current'] === '') {
             $stateText = 'Backing up VMs';
         } elseif ($bp['total'] > 0) {
-            $stateText = sprintf('Backing up %s (%d/%d)', $bp['current'], $bp['idx'], $bp['total']);
+            $stateText = sprintf('Backing up %s (%d/%d)', $bp['current'], $bp['step'], $bp['total']);
         } else {
             $stateText = sprintf('Backing up %s', $bp['current']);
         }
@@ -1074,12 +1142,15 @@ function tick_vmbackup(array $cfg, string $prefix, array &$state): void {
             // Known plan: one step per VM, each sized by its vdisk bytes so the
             // segmented row is proportional to the work rather than equal-width.
             $total = (int) $bp['total'];
-            $step  = steps_index((int) $bp['idx'], $total);
-            if (!isset($st['step_weights'])) {
+            $step  = steps_current((int) $bp['step'], $total);
+            // empty(), not isset(): a config read that loses a race with the
+            // vmbackup settings page returns [], and isset would cache that
+            // failure for the whole run with no retry.
+            if (empty($st['step_weights'])) {
                 $st['step_weights'] = vmbackup_step_weights(); // one-shot per run
             }
             // Only attach when the count matches (a mid-run config edit could
-            // desync it); a length mismatch is a 400 on the steps template.
+            // desync it); a length mismatch is a 422 on the steps template.
             $weights = count($st['step_weights']) === $total ? $st['step_weights'] : null;
             $content = [
                 'template'     => 'steps',
@@ -1093,16 +1164,18 @@ function tick_vmbackup(array $cfg, string $prefix, array &$state): void {
             $st['end_content'] = [
                 'template'     => 'steps',
                 'progress'     => 1.0,
-                'current_step' => $total - 1,
+                'current_step' => $total,
                 'total_steps'  => $total,
                 'state'        => $endState,
                 'icon'         => $endIcon,
                 'accent_color' => $endColor,
             ];
-            if ($weights !== null) {
-                $content['step_weights']           = $weights;
-                $st['end_content']['step_weights'] = $weights;
-            }
+            // Explicit null, not omission: content is an RFC 7396 merge patch,
+            // so leaving the key out keeps a previously sent array, which then
+            // fails the length check against the new total and 422s every
+            // remaining update of the run - the exact desync this guards.
+            $content['step_weights']           = $weights;
+            $st['end_content']['step_weights'] = $weights;
         } else {
             // Plan is "all"/unknown: steps needs a fixed total, so fall back to a
             // generic indeterminate frame rather than a bouncing fraction.
@@ -1167,6 +1240,11 @@ function tick_ups(array $cfg, string $prefix, array &$state): void {
         }
         if ($u['timeleft'] > 0) {
             $content['remaining_time'] = $u['timeleft'];
+        } else {
+            // Merge patch: without the null, an apcupsd that stops reporting
+            // TIMELEFT mid-outage leaves the last runtime frozen on the card,
+            // which is the one number someone acts on during a power cut.
+            $content['remaining_time'] = null;
         }
         // Default end frame is NEUTRAL. If the activity ends for any reason other
         // than a confirmed return to line power - the server shutting down on a

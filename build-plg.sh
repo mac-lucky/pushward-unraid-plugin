@@ -4,7 +4,7 @@
 set -euo pipefail
 SRC="$(cd "$(dirname "$0")/src" && pwd)"
 OUT="${1:-$(dirname "$0")/pushward-unraid.plg}"
-VERSION="2026.07.05"
+VERSION="2026.07.27"
 
 # Guard: a literal ]]> in any embedded TEXT file would break its CDATA section.
 # Skip *.png: the icon is base64-encoded (icon_file), never embedded raw, so a
@@ -75,6 +75,13 @@ cat <<XMLHEAD
 
 <CHANGES>
 ###$VERSION
+- Fix the step indicator on appdata and VM backup activities: it sat one step behind and never filled the last step
+- VM backup steps now follow each VM's place in the configured list, so a VM the backup skips no longer shifts every step after it
+- Size VM backup steps by the space each disk actually uses rather than the size it was provisioned at, and keep a VM that cannot be measured visible
+- Parity check: ignore an implausible ETA instead of sending an update the server rejects, and stop the bar running ahead when a check stalls
+- Parity check: show one ETA instead of a live countdown next to a frozen one
+- Clear the UPS runtime when apcupsd stops reporting it instead of leaving the last value on the card
+###2026.07.05
 - Parity check Live Activity now shows a smooth progress bar and a self-counting ETA that keeps moving between updates
 - VM backup steps are now sized to each VM's disk footprint, so the bar reflects how much data each one copies
 ###2026.06.26
