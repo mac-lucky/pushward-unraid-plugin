@@ -64,16 +64,18 @@ jobs:
             php -l "/tmp/plg/$f"
           done
 
-          # Exercise the pure steps-index math (the 1-based -> 0-based, clamped
-          # conversion the steps template relies on). PUSHWARD_NO_MAIN lets us
+          # Exercise the pure step-number math. Steps count from 1, with 0
+          # meaning "not started" and total meaning "all done" - the API and the
+          # phone both index that way, and an off-by-one here highlights the
+          # wrong segment on every steps activity. PUSHWARD_NO_MAIN lets us
           # require the daemon without starting its loop.
-          echo "== steps_index assertions =="
+          echo "== steps_current assertions =="
           php -r 'define("PUSHWARD_NO_MAIN", 1); require "/tmp/plg/pushward-monitor.php";
-            foreach ([[0,5,0],[1,5,0],[5,5,4],[3,5,2],[9,5,4],[0,0,0],[1,1,0]] as [$i,$t,$w]) {
-              $g = steps_index($i, $t);
-              if ($g !== $w) { fwrite(STDERR, "steps_index($i,$t)=$g want $w\n"); exit(1); }
+            foreach ([[0,5,0],[1,5,1],[5,5,5],[3,5,3],[9,5,5],[-3,5,0],[0,0,0],[1,1,1]] as [$i,$t,$w]) {
+              $g = steps_current($i, $t);
+              if ($g !== $w) { fwrite(STDERR, "steps_current($i,$t)=$g want $w\n"); exit(1); }
             }
-            echo "steps_index ok\n";'
+            echo "steps_current ok\n";'
           for p in pushward-settings.page pushward-activities.page; do
             echo "== php -l $p (body) =="
             awk 'f{print} /^---$/{f=1}' "/tmp/plg/$p" > "/tmp/plg/$p.body.php"
