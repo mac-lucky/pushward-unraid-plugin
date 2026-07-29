@@ -18,9 +18,20 @@ function pw_yesno($cfg, $key, $default) {
     return "<option value='true'$t>Enabled</option><option value='false'$f>Disabled</option>";
 }
 $configured = !empty($cfg['PUSHWARD_API_KEY']);
+// Same rule as pw_yesno: anything but the literal "false" is on.
+$activities = ($cfg['PUSHWARD_ACTIVITIES_ENABLED'] ?? 'true') !== 'false';
+
+// Which importances dynamix hands to notification agents. Bit 4 of each level's
+// method mask is the Agent method; Unraid ships normal="1", so Info notifications
+// are not forwarded until the user enables it under Settings -> Notifications.
+$notifyLevels = [];
+$notifyCfg = @parse_ini_file('/boot/config/plugins/dynamix/dynamix.cfg', true) ?: [];
+foreach (['normal' => 'Info', 'warning' => 'Warning', 'alert' => 'Alert'] as $k => $lbl) {
+    if (((int) ($notifyCfg['notify'][$k] ?? 0)) & 4) { $notifyLevels[] = $lbl; }
+}
 
 // Live status (best-effort, short timeouts so the page never hangs).
-$me = null; $actCode = 0; $daemon = false; $logTail = '';
+$me = null; $actCode = 0; $daemon = false; $cronOk = false; $logTail = ''; $logNote = '';
 if ($configured) {
     $url = rtrim($cfg['PUSHWARD_URL'] ?? 'https://api.pushward.app', '/');
     $key = $cfg['PUSHWARD_API_KEY'];
@@ -37,8 +48,26 @@ if ($configured) {
     // subcommand (test-activity/once/end-all) and falsely reports "running".
     // The [.] keeps the pattern from matching this exec's own sh -c argv.
     @exec('pgrep -f "pushward-monitor[.]php daemon" 2>/dev/null', $pg); $daemon = !empty($pg);
+    // update_cron merges the plugin cron files into /etc/cron.d/root, so read that
+    // file rather than shelling out again. Without our line nothing will ever
+    // start the daemon, which is a different problem from "not running right now"
+    // and the page used to report the two identically.
+    $cronOk = str_contains((string) @file_get_contents('/etc/cron.d/root'), "plugins/{$plugin}/watchdog.sh");
     if (is_file('/var/log/pushward-monitor.log')) {
         $logTail = htmlspecialchars(implode('', array_slice((array) @file('/var/log/pushward-monitor.log'), -10)), ENT_QUOTES);
+    }
+    // No log at all is the never-started case, which is exactly when the log panel
+    // used to vanish and leave nothing to act on.
+    if ($logTail === '') {
+        if (!$activities) {
+            $logNote = 'No log yet: Live Activities are set to Disabled.';
+        } elseif (!$cronOk) {
+            $logNote = 'No log yet. The watchdog cron is not registered, so nothing will start the monitor. Press Start monitor below.';
+        } elseif (!$daemon) {
+            $logNote = 'No log yet: the watchdog starts the monitor within a minute. Reload this page.';
+        } else {
+            $logNote = 'Monitor running, no log lines yet.';
+        }
     }
 }
 
@@ -57,7 +86,29 @@ if ($configured) {
         $chips[] = ['label' => 'Subscription', 'state' => 'warn', 'value' => 'Unknown'];
     }
     $chips[] = ['label' => 'Activity API', 'state' => $actCode === 200 ? 'ok' : 'warn', 'value' => $actCode === 200 ? 'Reachable' : ('HTTP ' . (int) $actCode)];
-    $chips[] = ['label' => 'Monitor daemon', 'state' => $daemon ? 'ok' : 'warn', 'value' => $daemon ? 'Running' : 'Not running', 'sub' => $daemon ? '' : 'starts within a minute'];
+    // Four states, because a bare "Not running" hid the one case that never
+    // recovers: with no watchdog line in cron nothing will ever start the daemon,
+    // and "starts within a minute" was then simply false. Running without the cron
+    // is a warning, not ok - it works now but has no restart net, and one click
+    // fixes it. Red is kept for the state that cannot heal itself.
+    if (!$activities) {
+        $chips[] = ['label' => 'Monitor daemon', 'state' => 'warn', 'value' => 'Disabled', 'sub' => 'Live Activities are off'];
+    } elseif ($daemon) {
+        $chips[] = ['label' => 'Monitor daemon', 'state' => $cronOk ? 'ok' : 'warn', 'value' => 'Running',
+            'sub' => $cronOk ? '' : 'watchdog cron missing'];
+    } elseif ($cronOk) {
+        $chips[] = ['label' => 'Monitor daemon', 'state' => 'warn', 'value' => 'Not running', 'sub' => 'starts within a minute'];
+    } else {
+        $chips[] = ['label' => 'Monitor daemon', 'state' => 'bad', 'value' => 'Not running', 'sub' => 'press Start monitor'];
+    }
+    if (!$notifyLevels) {
+        $chips[] = ['label' => 'Notifications', 'state' => 'bad', 'value' => 'Agent off',
+            'sub' => 'enable Agent under Settings, Notifications'];
+    } else {
+        $chips[] = ['label' => 'Notifications', 'state' => count($notifyLevels) === 3 ? 'ok' : 'warn',
+            'value' => count($notifyLevels) === 3 ? 'All levels' : implode(', ', $notifyLevels),
+            'sub' => count($notifyLevels) === 3 ? '' : 'other levels are not forwarded'];
+    }
 }
 function pw_chip_icon($cls) {
     static $icons = [
@@ -104,6 +155,7 @@ function pw_chip_icon($cls) {
 .pw-logwrap { margin:16px 0; }
 .pw-logwrap h4 { margin:0 0 6px; font-size:.78em; opacity:.6; font-weight:600; text-transform:uppercase; letter-spacing:.4px; }
 .pw-log { font-family:var(--font-mono,monospace); font-size:.8em; line-height:1.5; white-space:pre-wrap; word-break:break-word; background:rgba(128,128,128,.10); border:1px solid var(--border-color,rgba(128,128,128,.25)); padding:9px 11px; border-radius:7px; max-height:180px; overflow:auto; }
+.pw-log-empty { font-family:inherit; opacity:.7; }
 </style>
 
 <div class="pw-wrap">
@@ -128,6 +180,12 @@ function pw_chip_icon($cls) {
 
 <form markdown="1" name="pushward_unraid_settings" method="POST" action="/update.php" target="progressFrame" onsubmit="return pwKeepKey();">
 <input type="hidden" name="#file" value="<?= $cfg_path ?>">
+<?PHP
+/* update.php writes #file before it runs #command, so apply.sh sees the values
+   just saved. apply.sh also calls update_cron: after a fresh install the watchdog
+   line can be missing from /etc/cron.d/root, and then nothing starts the monitor. */
+?>
+<input type="hidden" name="#command" value="/usr/local/emhttp/plugins/<?= $plugin ?>/apply.sh">
 
 PushWard server URL:
 : <input type="text" name="PUSHWARD_URL" maxlength="200" value="<?= pw_val($cfg,'PUSHWARD_URL','https://api.pushward.app') ?>">
@@ -179,6 +237,13 @@ function pwKeepKey() {
 }
 </script>
 
+<form markdown="1" name="pushward_unraid_start" method="POST" action="/update.php" target="progressFrame">
+<input type="hidden" name="#command" value="/usr/local/emhttp/plugins/<?= $plugin ?>/apply.sh">
+&nbsp;
+: <input type="submit" value="Start monitor">
+
+</form>
+
 <form markdown="1" name="pushward_unraid_test" method="POST" action="/update.php" target="progressFrame">
 <input type="hidden" name="#command" value="/usr/local/emhttp/plugins/<?= $plugin ?>/test.sh">
 &nbsp;
@@ -198,10 +263,14 @@ function pwKeepKey() {
   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><line x1="12" y1="11" x2="12" y2="16"/><line x1="12" y1="8" x2="12" y2="8.5"/></svg>
   <p><strong>Notifications:</strong> Unraid calls the agent for any importance with the <strong>Agent</strong> method enabled under Settings &rarr; Notifications (Warning and Alert by default). <strong>Live Activities:</strong> a background monitor watches parity checks, appdata backups, the mover, VM backups and the UPS, and pushes progress to your phone. See the <a href="/Settings/pushward-activities">Activities</a> tab.</p>
 </div>
-<?PHP if ($configured && $logTail): ?>
+<?PHP if ($configured): ?>
 <div class="pw-logwrap">
   <h4>Monitor log</h4>
+  <?PHP if ($logTail): ?>
   <div class="pw-log"><?= $logTail ?></div>
+  <?PHP else: ?>
+  <div class="pw-log pw-log-empty"><?= htmlspecialchars($logNote, ENT_QUOTES) ?></div>
+  <?PHP endif; ?>
 </div>
 <?PHP endif; ?>
 </div>

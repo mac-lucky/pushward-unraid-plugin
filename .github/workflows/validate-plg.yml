@@ -50,11 +50,31 @@ jobs:
               print('extracted', base)
           PY
 
-          # Bash scripts: syntax + shellcheck.
-          for f in PushWard test.sh watchdog.sh test-activity.sh disks_mounted unmounting_disks; do
+          # Bash scripts: syntax + shellcheck, straight from src/. The drift check
+          # above proves the .plg embeds src/ byte for byte, so linting src/ covers
+          # the embedded copies - and unlike the extractor above it also reaches the
+          # <FILE Run> scripts (install-config.sh, post-install.sh, remove.sh),
+          # which carry no Name= attribute and so were never checked here. Those
+          # three run as root during install and uninstall. -s bash because they
+          # have no shebang: the FILE block supplies the interpreter.
+          for f in src/*.sh; do
             echo "== shellcheck $f =="
-            bash -n "/tmp/plg/$f"
-            shellcheck -s bash "/tmp/plg/$f"
+            bash -n "$f"
+            shellcheck -s bash "$f"
+          done
+
+          # A non-zero exit from an install Run block makes Unraid abort the whole
+          # install and file the .plg under plugins-error, so post-install must end
+          # by forcing success.
+          echo "== post-install.sh ends with exit 0 =="
+          [ "$(grep -v '^\s*#' src/post-install.sh | grep -v '^\s*$' | tail -n1)" = "exit 0" ]
+
+          # Every #command the settings page posts has to be a file the .plg
+          # actually installs, or the button silently does nothing.
+          for s in apply.sh test.sh test-activity.sh; do
+            echo "== $s is wired and shipped =="
+            grep -q "/$s\"" src/pushward-settings.page
+            grep -q "Name=\"/usr/local/emhttp/plugins/pushward-unraid/$s\"" pushward-unraid.plg
           done
 
           # PHP files: lint. The .page files have a "header\n---\nbody" layout;

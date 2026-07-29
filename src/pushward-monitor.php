@@ -18,9 +18,14 @@
  * beyond php-cli + curl, both always present on Unraid.
  *
  * Usage:
- *   php pushward-monitor.php             # run the daemon loop
+ *   php pushward-monitor.php daemon      # run the daemon loop
+ *   php pushward-monitor.php once        # one poll cycle, for debugging
  *   php pushward-monitor.php end-all     # end every active activity, clear state
  *   php pushward-monitor.php test-activity  # push a short demo activity
+ *
+ * Always pass "daemon" explicitly. It is also the default, but an argv without it
+ * matches none of the pgrep/pkill patterns the watchdog, the install scripts and
+ * the settings page use, so such an instance is invisible to all of them.
  */
 
 const CFG_FILE   = '/boot/config/plugins/pushward-unraid/pushward-unraid.cfg';
@@ -1357,9 +1362,18 @@ function cmd_test_activity(array $cfg): void {
 
 function run_daemon(array $cfg): void {
     @mkdir(STATE_DIR, 0755, true);
-    $lock = fopen(LOCK_FILE, 'c');
-    if (!$lock || !flock($lock, LOCK_EX | LOCK_NB)) {
-        exit(0); // another instance already owns the loop
+    $lock = @fopen(LOCK_FILE, 'c');
+    if (!$lock) {
+        // Losing the lock file is not the normal case below, and this exit used to
+        // happen before the first mlog() - so the log stayed empty and the settings
+        // page just said "Not running" with nothing to go on.
+        mlog('cannot open ' . LOCK_FILE . '; is ' . STATE_DIR . ' writable?', 'error');
+        exit(0);
+    }
+    if (!flock($lock, LOCK_EX | LOCK_NB)) {
+        // Another instance already owns the loop. Expected every time the watchdog
+        // double-launches, so stay quiet rather than logging once a minute.
+        exit(0);
     }
 
     $running = true;

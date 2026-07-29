@@ -3,7 +3,7 @@
 <!DOCTYPE PLUGIN [
 <!ENTITY name      "pushward-unraid">
 <!ENTITY author    "mac-lucky">
-<!ENTITY version   "2026.07.27">
+<!ENTITY version   "2026.07.30">
 <!ENTITY gitURL    "https://github.com/mac-lucky/pushward-unraid-plugin">
 <!ENTITY pluginURL "&gitURL;/raw/main/pushward-unraid.plg">
 <!ENTITY supportURL "&gitURL;/issues">
@@ -18,6 +18,12 @@
         min="6.12">
 
 <CHANGES>
+###2026.07.30
+- Fix a first-time install never starting the Live Activity monitor: Unraid marks a plugin installed only after its install scripts have run, so the watchdog cron entry was silently dropped and nothing ever launched the monitor
+- Apply now registers the watchdog cron and starts the monitor straight away, and there is a new "Start monitor" button next to the test buttons
+- The monitor status card tells the difference between Live Activities being switched off, the monitor starting shortly, and a missing watchdog cron that one click repairs
+- New status card for notifications: shows which importance levels Unraid actually hands to the agent, since Info is not forwarded until you enable it under Settings, Notifications
+- The monitor log panel no longer disappears when there is no log yet, and says what to do instead
 ###2026.07.27
 - Fix the step indicator on appdata and VM backup activities: it sat one step behind and never filled the last step
 - VM backup steps now follow each VM's place in the configured list, so a VM the backup skips no longer shifts every step after it
@@ -245,9 +251,14 @@ echo "Test notification sent to PushWard. Check your device."
  * beyond php-cli + curl, both always present on Unraid.
  *
  * Usage:
- *   php pushward-monitor.php             # run the daemon loop
+ *   php pushward-monitor.php daemon      # run the daemon loop
+ *   php pushward-monitor.php once        # one poll cycle, for debugging
  *   php pushward-monitor.php end-all     # end every active activity, clear state
  *   php pushward-monitor.php test-activity  # push a short demo activity
+ *
+ * Always pass "daemon" explicitly. It is also the default, but an argv without it
+ * matches none of the pgrep/pkill patterns the watchdog, the install scripts and
+ * the settings page use, so such an instance is invisible to all of them.
  */
 
 const CFG_FILE   = '/boot/config/plugins/pushward-unraid/pushward-unraid.cfg';
@@ -1584,9 +1595,18 @@ function cmd_test_activity(array $cfg): void {
 
 function run_daemon(array $cfg): void {
     @mkdir(STATE_DIR, 0755, true);
-    $lock = fopen(LOCK_FILE, 'c');
-    if (!$lock || !flock($lock, LOCK_EX | LOCK_NB)) {
-        exit(0); // another instance already owns the loop
+    $lock = @fopen(LOCK_FILE, 'c');
+    if (!$lock) {
+        // Losing the lock file is not the normal case below, and this exit used to
+        // happen before the first mlog() - so the log stayed empty and the settings
+        // page just said "Not running" with nothing to go on.
+        mlog('cannot open ' . LOCK_FILE . '; is ' . STATE_DIR . ' writable?', 'error');
+        exit(0);
+    }
+    if (!flock($lock, LOCK_EX | LOCK_NB)) {
+        // Another instance already owns the loop. Expected every time the watchdog
+        // double-launches, so stay quiet rather than logging once a minute.
+        exit(0);
     }
 
     $running = true;
@@ -1689,7 +1709,7 @@ switch ($mode) {
 }
 ]]>
 </INLINE>
-<MD5>2d4a2fc10d7a1f9ffe318fac3013721e</MD5>
+<MD5>63fc36101930079318ab6263a87ca3c6</MD5>
 </FILE>
 
 <!-- 5. Monitor watchdog (cron + array events start it). -->
@@ -1910,6 +1930,103 @@ php "$MON" test-activity
 <MD5>3fb0e4f776d47216b089e41141e2d9c5</MD5>
 </FILE>
 
+<!-- 7a. Apply / Start monitor helper (Settings page buttons): register cron, start monitor. -->
+<FILE Name="/usr/local/emhttp/plugins/pushward-unraid/apply.sh" Mode="0755">
+<INLINE>
+<![CDATA[#!/bin/bash
+# Backs both the Apply and the Start monitor buttons on Settings -> PushWard.
+# update.php writes #file before it runs #command, so on Apply the values the user
+# just saved are already on disk here.
+#
+# Two idempotent jobs, which is why one script serves both buttons:
+#   1. Register the watchdog cron. update_cron only merges a plugin's own *.cron
+#      once /var/log/plugins/<name>.plg exists, and Unraid creates that marker
+#      only after the install has finished, so a fresh install can end up with no
+#      watchdog line at all. Run from here, long after the install, it always
+#      lands - which also repairs a box installed before this was fixed.
+#   2. Start the monitor if it is not already running.
+#
+# It never kills a running daemon. The daemon re-reads the config on every poll
+# and adopts the new values itself, and when Live Activities are switched off it
+# ends its activities and exits on its own. Killing it would interrupt whatever it
+# is tracking, and killing it on Disabled would leave the cards frozen on the
+# phone until they go stale.
+#
+# Everything goes to stdout: Unraid runs this through popen($cmd,'r') and echoes
+# only stdout into the progress window, so a message on stderr would be lost.
+CFG="/boot/config/plugins/pushward-unraid/pushward-unraid.cfg"
+WATCHDOG="/usr/local/emhttp/plugins/pushward-unraid/watchdog.sh"
+PAT="pushward-monitor[.]php daemon"
+
+# Parse the config rather than sourcing it: the values are operator-entered free
+# text and `. "$CFG"` would execute any $(...) in them as root. Same pw_cfg as
+# watchdog.sh and agent-PushWard.sh carry, for the same reason.
+pw_cfg() {  # $1 = key -> value with surrounding quotes stripped
+  local v
+  v="$(grep -E "^$1=" "$CFG" 2>/dev/null | tail -n1 | cut -d= -f2-)"
+  v="${v%\"}"; v="${v#\"}"
+  printf '%s' "$v"
+}
+
+if [ -x /usr/local/sbin/update_cron ]; then
+  /usr/local/sbin/update_cron >/dev/null 2>&1 || true
+fi
+if grep -q 'pushward-unraid/watchdog\.sh' /etc/cron.d/root 2>/dev/null; then
+  echo "Watchdog cron registered; it rechecks the monitor every minute."
+else
+  echo "Warning: the watchdog cron did not register, so the monitor will not restart by itself."
+fi
+
+if [ ! -f "$CFG" ] || [ -z "$(pw_cfg PUSHWARD_API_KEY)" ]; then
+  echo "No API key set yet, so the monitor has nothing to authenticate with."
+  echo "Enter a key on the Settings tab and press Apply."
+  exit 0
+fi
+
+if [ "$(pw_cfg PUSHWARD_ACTIVITIES_ENABLED)" = "false" ]; then
+  if pgrep -f "$PAT" >/dev/null 2>&1; then
+    echo "Live Activities are Disabled; the monitor ends its activities and exits on its next poll."
+  else
+    echo "Live Activities are Disabled; the monitor stays stopped."
+  fi
+  exit 0
+fi
+
+PID="$(pgrep -f "$PAT" | head -n1)"
+if [ -n "$PID" ]; then
+  echo "Live Activity monitor already running (pid $PID)."
+  exit 0
+fi
+
+if [ ! -x "$WATCHDOG" ]; then
+  echo "PushWard watchdog is missing from $WATCHDOG. Reinstall the plugin."
+  exit 0
+fi
+
+# Launch through the watchdog rather than php directly: it owns the setsid and the
+# /var/run/pushward setup, so one place knows how to start the daemon.
+"$WATCHDOG" >/dev/null 2>&1 || true
+# The watchdog backgrounds the daemon, so it is not up the instant it returns.
+# Wait briefly so what is printed matches what the page shows on reload.
+for _ in $(seq 1 20); do
+  PID="$(pgrep -f "$PAT" | head -n1)"
+  if [ -n "$PID" ]; then
+    break
+  fi
+  sleep 0.2
+done
+
+if [ -n "$PID" ]; then
+  echo "Live Activity monitor started (pid $PID)."
+else
+  echo "Live Activity monitor did not start. Check /var/log/pushward-monitor.log"
+fi
+exit 0
+]]>
+</INLINE>
+<MD5>605d2ee4a18df01c0ed679baf42086a7</MD5>
+</FILE>
+
 <!-- 8. Array event: start the monitor when disks mount. -->
 <FILE Name="/usr/local/emhttp/plugins/pushward-unraid/event/disks_mounted" Mode="0755">
 <INLINE>
@@ -1986,9 +2103,20 @@ function pw_yesno($cfg, $key, $default) {
     return "<option value='true'$t>Enabled</option><option value='false'$f>Disabled</option>";
 }
 $configured = !empty($cfg['PUSHWARD_API_KEY']);
+// Same rule as pw_yesno: anything but the literal "false" is on.
+$activities = ($cfg['PUSHWARD_ACTIVITIES_ENABLED'] ?? 'true') !== 'false';
+
+// Which importances dynamix hands to notification agents. Bit 4 of each level's
+// method mask is the Agent method; Unraid ships normal="1", so Info notifications
+// are not forwarded until the user enables it under Settings -> Notifications.
+$notifyLevels = [];
+$notifyCfg = @parse_ini_file('/boot/config/plugins/dynamix/dynamix.cfg', true) ?: [];
+foreach (['normal' => 'Info', 'warning' => 'Warning', 'alert' => 'Alert'] as $k => $lbl) {
+    if (((int) ($notifyCfg['notify'][$k] ?? 0)) & 4) { $notifyLevels[] = $lbl; }
+}
 
 // Live status (best-effort, short timeouts so the page never hangs).
-$me = null; $actCode = 0; $daemon = false; $logTail = '';
+$me = null; $actCode = 0; $daemon = false; $cronOk = false; $logTail = ''; $logNote = '';
 if ($configured) {
     $url = rtrim($cfg['PUSHWARD_URL'] ?? 'https://api.pushward.app', '/');
     $key = $cfg['PUSHWARD_API_KEY'];
@@ -2005,8 +2133,26 @@ if ($configured) {
     // subcommand (test-activity/once/end-all) and falsely reports "running".
     // The [.] keeps the pattern from matching this exec's own sh -c argv.
     @exec('pgrep -f "pushward-monitor[.]php daemon" 2>/dev/null', $pg); $daemon = !empty($pg);
+    // update_cron merges the plugin cron files into /etc/cron.d/root, so read that
+    // file rather than shelling out again. Without our line nothing will ever
+    // start the daemon, which is a different problem from "not running right now"
+    // and the page used to report the two identically.
+    $cronOk = str_contains((string) @file_get_contents('/etc/cron.d/root'), "plugins/{$plugin}/watchdog.sh");
     if (is_file('/var/log/pushward-monitor.log')) {
         $logTail = htmlspecialchars(implode('', array_slice((array) @file('/var/log/pushward-monitor.log'), -10)), ENT_QUOTES);
+    }
+    // No log at all is the never-started case, which is exactly when the log panel
+    // used to vanish and leave nothing to act on.
+    if ($logTail === '') {
+        if (!$activities) {
+            $logNote = 'No log yet: Live Activities are set to Disabled.';
+        } elseif (!$cronOk) {
+            $logNote = 'No log yet. The watchdog cron is not registered, so nothing will start the monitor. Press Start monitor below.';
+        } elseif (!$daemon) {
+            $logNote = 'No log yet: the watchdog starts the monitor within a minute. Reload this page.';
+        } else {
+            $logNote = 'Monitor running, no log lines yet.';
+        }
     }
 }
 
@@ -2025,7 +2171,29 @@ if ($configured) {
         $chips[] = ['label' => 'Subscription', 'state' => 'warn', 'value' => 'Unknown'];
     }
     $chips[] = ['label' => 'Activity API', 'state' => $actCode === 200 ? 'ok' : 'warn', 'value' => $actCode === 200 ? 'Reachable' : ('HTTP ' . (int) $actCode)];
-    $chips[] = ['label' => 'Monitor daemon', 'state' => $daemon ? 'ok' : 'warn', 'value' => $daemon ? 'Running' : 'Not running', 'sub' => $daemon ? '' : 'starts within a minute'];
+    // Four states, because a bare "Not running" hid the one case that never
+    // recovers: with no watchdog line in cron nothing will ever start the daemon,
+    // and "starts within a minute" was then simply false. Running without the cron
+    // is a warning, not ok - it works now but has no restart net, and one click
+    // fixes it. Red is kept for the state that cannot heal itself.
+    if (!$activities) {
+        $chips[] = ['label' => 'Monitor daemon', 'state' => 'warn', 'value' => 'Disabled', 'sub' => 'Live Activities are off'];
+    } elseif ($daemon) {
+        $chips[] = ['label' => 'Monitor daemon', 'state' => $cronOk ? 'ok' : 'warn', 'value' => 'Running',
+            'sub' => $cronOk ? '' : 'watchdog cron missing'];
+    } elseif ($cronOk) {
+        $chips[] = ['label' => 'Monitor daemon', 'state' => 'warn', 'value' => 'Not running', 'sub' => 'starts within a minute'];
+    } else {
+        $chips[] = ['label' => 'Monitor daemon', 'state' => 'bad', 'value' => 'Not running', 'sub' => 'press Start monitor'];
+    }
+    if (!$notifyLevels) {
+        $chips[] = ['label' => 'Notifications', 'state' => 'bad', 'value' => 'Agent off',
+            'sub' => 'enable Agent under Settings, Notifications'];
+    } else {
+        $chips[] = ['label' => 'Notifications', 'state' => count($notifyLevels) === 3 ? 'ok' : 'warn',
+            'value' => count($notifyLevels) === 3 ? 'All levels' : implode(', ', $notifyLevels),
+            'sub' => count($notifyLevels) === 3 ? '' : 'other levels are not forwarded'];
+    }
 }
 function pw_chip_icon($cls) {
     static $icons = [
@@ -2072,6 +2240,7 @@ function pw_chip_icon($cls) {
 .pw-logwrap { margin:16px 0; }
 .pw-logwrap h4 { margin:0 0 6px; font-size:.78em; opacity:.6; font-weight:600; text-transform:uppercase; letter-spacing:.4px; }
 .pw-log { font-family:var(--font-mono,monospace); font-size:.8em; line-height:1.5; white-space:pre-wrap; word-break:break-word; background:rgba(128,128,128,.10); border:1px solid var(--border-color,rgba(128,128,128,.25)); padding:9px 11px; border-radius:7px; max-height:180px; overflow:auto; }
+.pw-log-empty { font-family:inherit; opacity:.7; }
 </style>
 
 <div class="pw-wrap">
@@ -2096,6 +2265,12 @@ function pw_chip_icon($cls) {
 
 <form markdown="1" name="pushward_unraid_settings" method="POST" action="/update.php" target="progressFrame" onsubmit="return pwKeepKey();">
 <input type="hidden" name="#file" value="<?= $cfg_path ?>">
+<?PHP
+/* update.php writes #file before it runs #command, so apply.sh sees the values
+   just saved. apply.sh also calls update_cron: after a fresh install the watchdog
+   line can be missing from /etc/cron.d/root, and then nothing starts the monitor. */
+?>
+<input type="hidden" name="#command" value="/usr/local/emhttp/plugins/<?= $plugin ?>/apply.sh">
 
 PushWard server URL:
 : <input type="text" name="PUSHWARD_URL" maxlength="200" value="<?= pw_val($cfg,'PUSHWARD_URL','https://api.pushward.app') ?>">
@@ -2147,6 +2322,13 @@ function pwKeepKey() {
 }
 </script>
 
+<form markdown="1" name="pushward_unraid_start" method="POST" action="/update.php" target="progressFrame">
+<input type="hidden" name="#command" value="/usr/local/emhttp/plugins/<?= $plugin ?>/apply.sh">
+&nbsp;
+: <input type="submit" value="Start monitor">
+
+</form>
+
 <form markdown="1" name="pushward_unraid_test" method="POST" action="/update.php" target="progressFrame">
 <input type="hidden" name="#command" value="/usr/local/emhttp/plugins/<?= $plugin ?>/test.sh">
 &nbsp;
@@ -2166,10 +2348,14 @@ function pwKeepKey() {
   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><line x1="12" y1="11" x2="12" y2="16"/><line x1="12" y1="8" x2="12" y2="8.5"/></svg>
   <p><strong>Notifications:</strong> Unraid calls the agent for any importance with the <strong>Agent</strong> method enabled under Settings &rarr; Notifications (Warning and Alert by default). <strong>Live Activities:</strong> a background monitor watches parity checks, appdata backups, the mover, VM backups and the UPS, and pushes progress to your phone. See the <a href="/Settings/pushward-activities">Activities</a> tab.</p>
 </div>
-<?PHP if ($configured && $logTail): ?>
+<?PHP if ($configured): ?>
 <div class="pw-logwrap">
   <h4>Monitor log</h4>
+  <?PHP if ($logTail): ?>
   <div class="pw-log"><?= $logTail ?></div>
+  <?PHP else: ?>
+  <div class="pw-log pw-log-empty"><?= htmlspecialchars($logNote, ENT_QUOTES) ?></div>
+  <?PHP endif; ?>
 </div>
 <?PHP endif; ?>
 </div>
@@ -2214,7 +2400,7 @@ function pwKeepKey() {
 </script>
 ]]>
 </INLINE>
-<MD5>410211769e65a90a825e232f4349bb29</MD5>
+<MD5>21b06a8a9575f7f4ac16a23afd6b63d6</MD5>
 </FILE>
 
 <!-- 11. Activities tab page (live dashboard). -->
@@ -2550,18 +2736,53 @@ mkdir -p /var/run/pushward
 # process keeps the old file in memory). Wait for the old daemon to be fully
 # gone (TERM grace then KILL) so it releases its flock before the watchdog
 # launches the new one, since a still-alive old instance would keep the lock and the
-# fresh daemon would exit immediately. Then register the watchdog cron.
-PAT="pushward-monitor.php daemon"
+# fresh daemon would exit immediately.
+PAT="pushward-monitor[.]php daemon"
 pkill -TERM -f "$PAT" 2>/dev/null || true
 for _ in $(seq 1 30); do
   pgrep -f "$PAT" >/dev/null 2>&1 || break
   sleep 0.1
 done
 pkill -KILL -f "$PAT" 2>/dev/null || true
-/usr/local/sbin/update_cron >/dev/null 2>&1 || true
+
+# Register the watchdog cron. update_cron reads the .cron files only of plugins it
+# finds marked installed in /var/log/plugins, and Unraid creates that marker only
+# AFTER these install scripts finish - so on a first install ours is invisible to
+# it, the watchdog line never reaches /etc/cron.d/root, and nothing ever starts the
+# monitor. Stand the marker up for the call, then drop it again so the plugin
+# manager can create the real one itself. Its glob matches the directory entry and
+# never stats the target, so this works even though the .plg has not been copied to
+# /boot yet. Testing both -e and -L because -e alone is false for a dangling
+# symlink: only a path with nothing on it is ours to create and take back down.
+MARKER="/var/log/plugins/pushward-unraid.plg"
+MADE_MARKER=""
+if [ ! -e "$MARKER" ] && [ ! -L "$MARKER" ]; then
+  mkdir -p /var/log/plugins
+  if ln -s /boot/config/plugins/pushward-unraid.plg "$MARKER" 2>/dev/null; then
+    MADE_MARKER=1
+  fi
+fi
+if [ -x /usr/local/sbin/update_cron ]; then
+  /usr/local/sbin/update_cron >/dev/null 2>&1 || true
+fi
+if [ -n "$MADE_MARKER" ]; then
+  rm -f "$MARKER"
+fi
+
+# Record the outcome. Nothing else does: the banner below prints success either
+# way, so without this a missing cron entry stays invisible until someone wonders
+# why no Live Activity ever appeared.
+if grep -q 'pushward-unraid/watchdog\.sh' /etc/cron.d/root 2>/dev/null; then
+  logger -t pushward "watchdog cron registered"
+else
+  logger -t pushward "WARNING: watchdog cron not registered, the Live Activity monitor will not start"
+fi
+
+# Starts the monitor on an upgrade. On a first install the key is still empty, so
+# the watchdog declines and the Apply button starts it once a key is entered.
 /usr/local/emhttp/plugins/pushward-unraid/watchdog.sh >/dev/null 2>&1 || true
 
-cat <<EOF
+cat <<'EOF'
 
 ================================================================
   PushWard Unraid plugin installed.
@@ -2576,6 +2797,17 @@ cat <<EOF
 ================================================================
 
 EOF
+
+# Say so in the install window if the cron still did not land. Silence here is what
+# let this ship broken in the first place; the Apply button repairs it.
+if ! grep -q 'pushward-unraid/watchdog\.sh' /etc/cron.d/root 2>/dev/null; then
+  echo "WARNING: the watchdog cron is not registered, so Live Activities will not start."
+  echo "Open Settings -> User Utilities -> PushWard and press Apply to fix it."
+fi
+
+# Always succeed: Unraid treats a non-zero Run block as a failed install and files
+# the .plg under plugins-error, so nothing above may decide the exit status.
+exit 0
 ]]>
 </INLINE>
 </FILE>

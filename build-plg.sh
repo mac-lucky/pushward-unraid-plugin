@@ -4,7 +4,7 @@
 set -euo pipefail
 SRC="$(cd "$(dirname "$0")/src" && pwd)"
 OUT="${1:-$(dirname "$0")/pushward-unraid.plg}"
-VERSION="2026.07.27"
+VERSION="2026.07.30"
 
 # Guard: a literal ]]> in any embedded TEXT file would break its CDATA section.
 # Skip *.png: the icon is base64-encoded (icon_file), never embedded raw, so a
@@ -75,6 +75,12 @@ cat <<XMLHEAD
 
 <CHANGES>
 ###$VERSION
+- Fix a first-time install never starting the Live Activity monitor: Unraid marks a plugin installed only after its install scripts have run, so the watchdog cron entry was silently dropped and nothing ever launched the monitor
+- Apply now registers the watchdog cron and starts the monitor straight away, and there is a new "Start monitor" button next to the test buttons
+- The monitor status card tells the difference between Live Activities being switched off, the monitor starting shortly, and a missing watchdog cron that one click repairs
+- New status card for notifications: shows which importance levels Unraid actually hands to the agent, since Info is not forwarded until you enable it under Settings, Notifications
+- The monitor log panel no longer disappears when there is no log yet, and says what to do instead
+###2026.07.27
 - Fix the step indicator on appdata and VM backup activities: it sat one step behind and never filled the last step
 - VM backup steps now follow each VM's place in the configured list, so a VM the backup skips no longer shifts every step after it
 - Size VM backup steps by the space each disk actually uses rather than the size it was provisioned at, and keep a VM that cannot be measured visible
@@ -132,6 +138,7 @@ named_file "4. Live Activity monitor daemon." "/usr/local/emhttp/plugins/pushwar
 named_file "5. Monitor watchdog (cron + array events start it)." "/usr/local/emhttp/plugins/pushward-unraid/watchdog.sh" "0755" watchdog.sh
 named_file "6. Dashboard server-side proxy (keeps the key off the browser)." "/usr/local/emhttp/plugins/pushward-unraid/pwapi.php" "0644" pwapi.php
 named_file "7. Test Live Activity helper (Settings page button)." "/usr/local/emhttp/plugins/pushward-unraid/test-activity.sh" "0755" test-activity.sh
+named_file "7a. Apply / Start monitor helper (Settings page buttons): register cron, start monitor." "/usr/local/emhttp/plugins/pushward-unraid/apply.sh" "0755" apply.sh
 named_file "8. Array event: start the monitor when disks mount." "/usr/local/emhttp/plugins/pushward-unraid/event/disks_mounted" "0755" event-disks_mounted.sh
 named_file "9. Array event: stop monitor and end activities when unmounting." "/usr/local/emhttp/plugins/pushward-unraid/event/unmounting_disks" "0755" event-unmounting_disks.sh
 named_file "10. Tab container (Settings -> User Utilities -> PushWard)." "/usr/local/emhttp/plugins/pushward-unraid/pushward-unraid.page" "0644" pushward-unraid.page
