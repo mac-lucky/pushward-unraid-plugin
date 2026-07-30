@@ -3,7 +3,8 @@
 # verify their config without waiting for a real Unraid event.
 AGENT="/boot/config/plugins/dynamix/notifications/agents/PushWard"
 if [ ! -f "$AGENT" ]; then
-  echo "PushWard agent not installed at $AGENT" >&2
+  # update.php echoes only stdout into the progress window, so not >&2.
+  echo "PushWard agent not installed at $AGENT. Reinstall the plugin."
   exit 1
 fi
 EVENT="Test" \

@@ -21,6 +21,32 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 2
+
+      - name: Check the release version was bumped
+        run: |
+          set -euo pipefail
+          ver=$(sed -n 's/^VERSION="\([^"]*\)"/\1/p' build-plg.sh); ver=${ver%%$'\n'*}
+          printf '%s' "$ver" | grep -qE '^[0-9]{4}\.[0-9]{2}\.[0-9]{2}[a-z]?$' \
+            || { echo "::error::VERSION '$ver' is not YYYY.MM.DD with an optional letter suffix"; exit 1; }
+          grep -qF "###$ver" pushward-unraid.plg \
+            || { echo "::error::no ###$ver entry in <CHANGES>; the update dialog would show the previous notes"; exit 1; }
+          grep -qE "<!ENTITY version +\"$ver\">" pushward-unraid.plg \
+            || { echo "::error::the .plg version entity does not match VERSION=$ver"; exit 1; }
+          # Unraid skips re-extracting every <FILE> payload when the version string is
+          # unchanged, so shipping a payload edit without a bump delivers nothing at
+          # all, silently. A same-day re-release needs a letter suffix.
+          base="${{ github.event.pull_request.base.sha || 'HEAD~1' }}"
+          if git rev-parse --verify -q "$base" >/dev/null; then
+            prev=$(git show "$base:build-plg.sh" | sed -n 's/^VERSION="\([^"]*\)"/\1/p'); prev=${prev%%$'\n'*}
+            if [ -n "$(git diff --name-only "$base" -- src/ pushward-unraid.plg)" ]; then
+              [ "$ver" != "$prev" ] \
+                || { echo "::error::payloads changed but VERSION is still $prev; the update would ship nothing"; exit 1; }
+              [ "$(printf '%s\n%s\n' "$prev" "$ver" | sort | head -n1)" = "$prev" ] \
+                || { echo "::error::VERSION went backwards ($prev -> $ver); Unraid compares these as plain strings"; exit 1; }
+            fi
+          fi
 
       - name: Check pushward-unraid.plg is in sync with src/
         run: |
@@ -63,18 +89,73 @@ jobs:
             shellcheck -s bash "$f"
           done
 
-          # A non-zero exit from an install Run block makes Unraid abort the whole
-          # install and file the .plg under plugins-error, so post-install must end
-          # by forcing success.
-          echo "== post-install.sh ends with exit 0 =="
-          [ "$(grep -v '^\s*#' src/post-install.sh | grep -v '^\s*$' | tail -n1)" = "exit 0" ]
+          # Unraid aborts the whole install and files the .plg under plugins-error if
+          # a <FILE Run> block exits non-zero, so run post-install.sh and remove.sh
+          # and check the status. A textual "ends with exit 0" check passes a script
+          # that has grown a `set -e` and a failing command, so it proves nothing.
+          # Run as root in a container: that is how Unraid runs them, it exercises
+          # the temporary /var/log/plugins marker (a marker left behind dangles and
+          # makes the plugin refuse to install until a reboot), and it keeps the
+          # runner clean. install-config.sh is deliberately excluded - it carries
+          # `set -e` on purpose so a boot device that cannot be written aborts the
+          # install rather than leaving a plugin with no config.
+          echo "== post-install.sh and remove.sh exit 0, and clean up after themselves =="
+          docker run --rm -v "$PWD/src:/src:ro" ubuntu:24.04 bash -c '
+            set -u
+            bash /src/post-install.sh >/tmp/pi.log 2>&1 || { echo "post-install.sh exited $?"; cat /tmp/pi.log; exit 1; }
+            grep -q "PushWard Unraid plugin installed" /tmp/pi.log || { echo "no install banner"; exit 1; }
+            grep -q "watchdog cron is not registered" /tmp/pi.log || { echo "missing-cron warning not printed"; exit 1; }
+            if [ -e /var/log/plugins/pushward-unraid.plg ] || [ -L /var/log/plugins/pushward-unraid.plg ]; then
+              echo "temporary marker left behind in /var/log/plugins"; exit 1
+            fi
+            [ -d /var/run/pushward ] || { echo "state dir not created"; exit 1; }
+            bash /src/remove.sh >/dev/null 2>&1 || { echo "remove.sh exited $?"; exit 1; }
+          ' || { echo "::error::an install/uninstall Run block misbehaved; Unraid would report a failed install"; exit 1; }
 
-          # Every #command the settings page posts has to be a file the .plg
-          # actually installs, or the button silently does nothing.
-          for s in apply.sh test.sh test-activity.sh; do
-            echo "== $s is wired and shipped =="
-            grep -q "/$s\"" src/pushward-settings.page
-            grep -q "Name=\"/usr/local/emhttp/plugins/pushward-unraid/$s\"" pushward-unraid.plg
+          # Every #command a settings page posts must be shipped, and shipped
+          # executable - a 0644 #command dies in popen() as another silent dead
+          # button. Derived from the page, because a hand-written list is exactly
+          # what goes stale without anyone noticing.
+          mapfile -t cmds < <(grep -ho 'name="#command"[[:space:]]*value="[^"]*"' src/*.page \
+            | sed -e 's/.*value="//' -e 's/"$//' -e 's|<?= $plugin ?>|pushward-unraid|g' | sort -u)
+          [ "${#cmds[@]}" -gt 0 ] || { echo "::error::no #command found - did the form markup change?"; exit 1; }
+          for cmd in "${cmds[@]}"; do
+            echo "== $cmd is shipped Mode=0755 =="
+            grep -qF "<FILE Name=\"$cmd\" Mode=\"0755\">" pushward-unraid.plg \
+              || { echo "::error::$cmd is posted by a settings page but not shipped Mode=0755"; exit 1; }
+          done
+
+          # Every <FILE Name> block needs an <MD5>, or Unraid silently never
+          # replaces that file on upgrade and users stay on the old code.
+          echo "== every <FILE Name> block carries an <MD5> =="
+          [ "$(grep -c '<FILE Name=' pushward-unraid.plg)" = "$(grep -c '<MD5>' pushward-unraid.plg)" ] \
+            || { echo "::error::a <FILE Name> block is missing its <MD5>"; exit 1; }
+
+          # The watchdog path is written by the .cron and matched by three consumers;
+          # the daemon's argv is set by watchdog.sh and matched by four patterns.
+          # Rename either and every check goes quiet instead of failing.
+          echo "== the watchdog path is spelled consistently =="
+          grep -qF 'plugins/pushward-unraid/watchdog.sh' src/pushward-unraid.cron \
+            || { echo "::error::the cron no longer runs plugins/pushward-unraid/watchdog.sh"; exit 1; }
+          for f in src/post-install.sh src/apply.sh src/pushward-settings.page; do
+            # The .page interpolates the plugin name, so resolve it before matching.
+            # Assigned rather than piped into grep -q: under pipefail, grep -q closing
+            # the pipe early makes sed die of SIGPIPE and fails the step spuriously.
+            resolved=$(sed -e 's|{$plugin}|pushward-unraid|g' -e 's|<?= $plugin ?>|pushward-unraid|g' "$f")
+            case "$resolved" in
+              *plugins/pushward-unraid/watchdog.sh*) ;;
+              *) echo "::error::$f no longer matches the path the cron writes"; exit 1 ;;
+            esac
+          done
+
+          echo "== every daemon pgrep/pkill pattern matches the launched argv =="
+          launch=$(grep -oE 'setsid php "\$MON" [a-z-]+' src/watchdog.sh)
+          argv="php /usr/local/emhttp/plugins/pushward-unraid/pushward-monitor.php ${launch##* }"
+          mapfile -t pats < <(grep -rhoE '"pushward-monitor\[?\.?\]?php [a-z-]+"' src/ | tr -d '"' | sort -u)
+          [ "${#pats[@]}" -gt 0 ] || { echo "::error::no daemon match pattern found in src/"; exit 1; }
+          for p in "${pats[@]}"; do
+            grep -qE -- "$p" <<<"$argv" \
+              || { echo "::error::pattern [$p] does not match the launched argv [$argv]"; exit 1; }
           done
 
           # PHP files: lint. The .page files have a "header\n---\nbody" layout;

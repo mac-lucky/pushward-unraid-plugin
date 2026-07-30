@@ -3,7 +3,8 @@
 # straight from Settings -> PushWard.
 MON="/usr/local/emhttp/plugins/pushward-unraid/pushward-monitor.php"
 if [ ! -f "$MON" ]; then
-  echo "PushWard monitor not installed at $MON" >&2
+  # update.php echoes only stdout into the progress window, so not >&2.
+  echo "PushWard monitor not installed at $MON. Reinstall the plugin."
   exit 1
 fi
 php "$MON" test-activity

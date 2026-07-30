@@ -2,7 +2,7 @@ echo "Uninstalling pushward-unraid plugin..."
 # Stop the monitor and end any active Live Activities before removing its code.
 # Wait for the daemon to be fully gone (TERM grace then KILL) so it can't re-PATCH
 # an activity back to 'ongoing' after end-all ends it.
-PAT="pushward-monitor.php daemon"
+PAT="pushward-monitor[.]php daemon"
 pkill -TERM -f "$PAT" 2>/dev/null || true
 for _ in $(seq 1 30); do
   pgrep -f "$PAT" >/dev/null 2>&1 || break

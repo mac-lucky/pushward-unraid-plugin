@@ -4,11 +4,12 @@
 # just saved are already on disk here.
 #
 # Two idempotent jobs, which is why one script serves both buttons:
-#   1. Register the watchdog cron. update_cron only merges a plugin's own *.cron
-#      once /var/log/plugins/<name>.plg exists, and Unraid creates that marker
-#      only after the install has finished, so a fresh install can end up with no
-#      watchdog line at all. Run from here, long after the install, it always
-#      lands - which also repairs a box installed before this was fixed.
+#   1. Register the watchdog cron. A fresh install can end up with no watchdog line
+#      at all (see post-install.sh); by the time a button runs, the plugin is marked
+#      installed in /var/log/plugins, so update_cron always merges it - which also
+#      repairs a box installed before this was fixed. Unconditional on purpose: a
+#      grep for the line proves only that some line mentions the path, so it would
+#      miss a schedule change shipped in an upgrade.
 #   2. Start the monitor if it is not already running.
 #
 # It never kills a running daemon. The daemon re-reads the config on every poll
@@ -28,28 +29,39 @@ PAT="pushward-monitor[.]php daemon"
 # watchdog.sh and agent-PushWard.sh carry, for the same reason.
 pw_cfg() {  # $1 = key -> value with surrounding quotes stripped
   local v
-  v="$(grep -E "^$1=" "$CFG" 2>/dev/null | tail -n1 | cut -d= -f2-)"
+  v="$(grep -E "^[[:space:]]*$1[[:space:]]*=" "$CFG" 2>/dev/null | tail -n1 | cut -d= -f2-)"
+  v="${v%$'\r'}"                   # /boot is vfat: a Windows editor leaves a CR here,
+                                   # and then "false" reads back as false" and a
+                                   # disabled monitor would start anyway
+  v="${v#"${v%%[![:space:]]*}"}"   # trim around the value, never inside it, so a
+  v="${v%"${v##*[![:space:]]}"}"   # deliberate space in the server name survives
   v="${v%\"}"; v="${v#\"}"
   printf '%s' "$v"
 }
 
+# Deliberately pgrep and not a non-blocking flock on the monitor's lock file, even
+# though that would be cheaper and a truer signal: the daemon exits silently when it
+# cannot take that lock, so a probe landing between its exec and its flock() would
+# acquire the lock and kill the daemon it was checking on.
+monitor_pid() { pgrep -f "$PAT" | head -n1; }
+
 if [ -x /usr/local/sbin/update_cron ]; then
   /usr/local/sbin/update_cron >/dev/null 2>&1 || true
 fi
-if grep -q 'pushward-unraid/watchdog\.sh' /etc/cron.d/root 2>/dev/null; then
+if grep -qF 'plugins/pushward-unraid/watchdog.sh' /etc/cron.d/root 2>/dev/null; then
   echo "Watchdog cron registered; it rechecks the monitor every minute."
 else
   echo "Warning: the watchdog cron did not register, so the monitor will not restart by itself."
 fi
 
-if [ ! -f "$CFG" ] || [ -z "$(pw_cfg PUSHWARD_API_KEY)" ]; then
+if [ -z "$(pw_cfg PUSHWARD_API_KEY)" ]; then
   echo "No API key set yet, so the monitor has nothing to authenticate with."
   echo "Enter a key on the Settings tab and press Apply."
   exit 0
 fi
 
 if [ "$(pw_cfg PUSHWARD_ACTIVITIES_ENABLED)" = "false" ]; then
-  if pgrep -f "$PAT" >/dev/null 2>&1; then
+  if [ -n "$(monitor_pid)" ]; then
     echo "Live Activities are Disabled; the monitor ends its activities and exits on its next poll."
   else
     echo "Live Activities are Disabled; the monitor stays stopped."
@@ -57,7 +69,7 @@ if [ "$(pw_cfg PUSHWARD_ACTIVITIES_ENABLED)" = "false" ]; then
   exit 0
 fi
 
-PID="$(pgrep -f "$PAT" | head -n1)"
+PID="$(monitor_pid)"
 if [ -n "$PID" ]; then
   echo "Live Activity monitor already running (pid $PID)."
   exit 0
@@ -71,10 +83,10 @@ fi
 # Launch through the watchdog rather than php directly: it owns the setsid and the
 # /var/run/pushward setup, so one place knows how to start the daemon.
 "$WATCHDOG" >/dev/null 2>&1 || true
-# The watchdog backgrounds the daemon, so it is not up the instant it returns.
-# Wait briefly so what is printed matches what the page shows on reload.
-for _ in $(seq 1 20); do
-  PID="$(pgrep -f "$PAT" | head -n1)"
+# Wait briefly so what is printed matches what the page shows on reload. The daemon
+# is normally visible on the first probe, since pgrep matches the argv set at exec.
+for _ in $(seq 1 10); do
+  PID="$(monitor_pid)"
   if [ -n "$PID" ]; then
     break
   fi

@@ -13,7 +13,12 @@ MON="/usr/local/emhttp/plugins/pushward-unraid/pushward-monitor.php"
 # cron. grep+cut never evaluates the value.
 pw_cfg() {  # $1 = key -> value with surrounding quotes stripped
   local v
-  v="$(grep -E "^$1=" "$CFG" 2>/dev/null | tail -n1 | cut -d= -f2-)"
+  v="$(grep -E "^[[:space:]]*$1[[:space:]]*=" "$CFG" 2>/dev/null | tail -n1 | cut -d= -f2-)"
+  v="${v%$'\r'}"                   # /boot is vfat: a Windows editor leaves a CR here,
+                                   # and then "false" reads back as false" and a
+                                   # disabled monitor would start anyway
+  v="${v#"${v%%[![:space:]]*}"}"   # trim around the value, never inside it, so a
+  v="${v%"${v##*[![:space:]]}"}"   # deliberate space in the server name survives
   v="${v%\"}"; v="${v#\"}"
   printf '%s' "$v"
 }
@@ -24,7 +29,7 @@ PUSHWARD_ACTIVITIES_ENABLED="$(pw_cfg PUSHWARD_ACTIVITIES_ENABLED)"
 [ "${PUSHWARD_ACTIVITIES_ENABLED:-true}" = "false" ] && exit 0
 [ -f "$MON" ] || exit 0
 
-if pgrep -f "pushward-monitor.php daemon" >/dev/null 2>&1; then
+if pgrep -f "pushward-monitor[.]php daemon" >/dev/null 2>&1; then
   exit 0
 fi
 

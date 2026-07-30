@@ -2,7 +2,7 @@
 # Array is stopping: stop the monitor and end any active Live Activities so the
 # user isn't left with a frozen "Parity 50%" card after the array goes down.
 
-PAT="pushward-monitor.php daemon"
+PAT="pushward-monitor[.]php daemon"
 
 # Stop the daemon and WAIT for it to actually be gone before ending activities.
 # Otherwise its in-flight tick can re-PATCH an activity back to 'ongoing' after

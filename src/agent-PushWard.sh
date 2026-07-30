@@ -14,7 +14,11 @@ CFG="/boot/config/plugins/pushward-unraid/pushward-unraid.cfg"
 # in them on every notification. grep+cut never evaluates the value.
 pw_cfg() {  # $1 = key -> value with surrounding quotes stripped
   local v
-  v="$(grep -E "^$1=" "$CFG" 2>/dev/null | tail -n1 | cut -d= -f2-)"
+  v="$(grep -E "^[[:space:]]*$1[[:space:]]*=" "$CFG" 2>/dev/null | tail -n1 | cut -d= -f2-)"
+  v="${v%$'\r'}"                   # /boot is vfat: a Windows editor leaves a CR here,
+                                   # which would otherwise ride along into the URL
+  v="${v#"${v%%[![:space:]]*}"}"   # trim around the value, never inside it, so a
+  v="${v%"${v##*[![:space:]]}"}"   # deliberate space in the server name survives
   v="${v%\"}"; v="${v#\"}"
   printf '%s' "$v"
 }

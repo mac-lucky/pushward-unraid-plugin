@@ -21,25 +21,28 @@ pkill -KILL -f "$PAT" 2>/dev/null || true
 # never stats the target, so this works even though the .plg has not been copied to
 # /boot yet. Testing both -e and -L because -e alone is false for a dangling
 # symlink: only a path with nothing on it is ours to create and take back down.
+# (Known Unraid issue; the community alternative is to defer the update_cron call
+# with `at now`, but that returns before the outcome is known, so this script could
+# no longer report it.) The trap matters: if a signal lands while update_cron is
+# reading the plugin .cron files off the flash drive, a marker left behind would
+# dangle - and Unraid then reads it, takes the re-install branch, fails to read a
+# version from the .plg it never copied, and refuses to install or update the
+# plugin until the box reboots.
 MARKER="/var/log/plugins/pushward-unraid.plg"
-MADE_MARKER=""
 if [ ! -e "$MARKER" ] && [ ! -L "$MARKER" ]; then
   mkdir -p /var/log/plugins
   if ln -s /boot/config/plugins/pushward-unraid.plg "$MARKER" 2>/dev/null; then
-    MADE_MARKER=1
+    trap 'rm -f "$MARKER"' EXIT INT TERM HUP
   fi
 fi
 if [ -x /usr/local/sbin/update_cron ]; then
   /usr/local/sbin/update_cron >/dev/null 2>&1 || true
 fi
-if [ -n "$MADE_MARKER" ]; then
-  rm -f "$MARKER"
-fi
 
-# Record the outcome. Nothing else does: the banner below prints success either
-# way, so without this a missing cron entry stays invisible until someone wonders
-# why no Live Activity ever appeared.
-if grep -q 'pushward-unraid/watchdog\.sh' /etc/cron.d/root 2>/dev/null; then
+# The banner below prints success either way, so record the real outcome. One
+# predicate, checked once: the two call sites are far apart and must not disagree.
+cron_ok() { grep -qF 'plugins/pushward-unraid/watchdog.sh' /etc/cron.d/root 2>/dev/null; }
+if cron_ok; then
   logger -t pushward "watchdog cron registered"
 else
   logger -t pushward "WARNING: watchdog cron not registered, the Live Activity monitor will not start"
@@ -65,9 +68,7 @@ cat <<'EOF'
 
 EOF
 
-# Say so in the install window if the cron still did not land. Silence here is what
-# let this ship broken in the first place; the Apply button repairs it.
-if ! grep -q 'pushward-unraid/watchdog\.sh' /etc/cron.d/root 2>/dev/null; then
+if ! cron_ok; then
   echo "WARNING: the watchdog cron is not registered, so Live Activities will not start."
   echo "Open Settings -> User Utilities -> PushWard and press Apply to fix it."
 fi

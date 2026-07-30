@@ -4,7 +4,7 @@
 set -euo pipefail
 SRC="$(cd "$(dirname "$0")/src" && pwd)"
 OUT="${1:-$(dirname "$0")/pushward-unraid.plg}"
-VERSION="2026.07.30"
+VERSION="2026.07.30b"
 
 # Guard: a literal ]]> in any embedded TEXT file would break its CDATA section.
 # Skip *.png: the icon is base64-encoded (icon_file), never embedded raw, so a
@@ -75,6 +75,12 @@ cat <<XMLHEAD
 
 <CHANGES>
 ###$VERSION
+- Honour a Live Activities "Disabled" setting saved from a Windows editor: a carriage return in the config file made the monitor read the value as enabled and start anyway
+- Never leave a stray marker behind if the box is shut down mid-install, which could make the plugin refuse to install or update until a reboot
+- The notification status card now resolves which importance levels reach the agent the same way Unraid itself does
+- The monitor status card and the log panel note can no longer disagree about the same state
+- The test buttons now report a missing agent or monitor instead of showing an empty progress window
+###2026.07.30
 - Fix a first-time install never starting the Live Activity monitor: Unraid marks a plugin installed only after its install scripts have run, so the watchdog cron entry was silently dropped and nothing ever launched the monitor
 - Apply now registers the watchdog cron and starts the monitor straight away, and there is a new "Start monitor" button next to the test buttons
 - The monitor status card tells the difference between Live Activities being switched off, the monitor starting shortly, and a missing watchdog cron that one click repairs
