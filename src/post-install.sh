@@ -15,24 +15,22 @@ pkill -KILL -f "$PAT" 2>/dev/null || true
 # Register the watchdog cron. update_cron reads a plugin's .cron only once Unraid
 # has marked it installed in /var/log/plugins, and that happens AFTER these scripts
 # run - so on a first install ours is invisible and the monitor never starts. Its
-# glob matches the directory entry without stating the target, so a marker we stand
+# glob matches the directory entry and never stats the target, so a marker we stand
 # up here works even before the .plg is copied to /boot. -e alone is false for a
 # dangling symlink, hence -e and -L: only an empty path is ours to take back down.
 # The cleanup must stay in a trap - a marker left behind by a signal dangles, and
 # Unraid then refuses to install or update the plugin until the box reboots.
 MARKER="/var/log/plugins/pushward-unraid.plg"
-if [ ! -e "$MARKER" ] && [ ! -L "$MARKER" ]; then
-  mkdir -p /var/log/plugins
-  if ln -s /boot/config/plugins/pushward-unraid.plg "$MARKER" 2>/dev/null; then
-    trap 'rm -f "$MARKER"' EXIT INT TERM HUP
-  fi
+mkdir -p /var/log/plugins
+if [ ! -e "$MARKER" ] && [ ! -L "$MARKER" ] && ln -s /boot/config/plugins/pushward-unraid.plg "$MARKER" 2>/dev/null; then
+  trap 'rm -f "$MARKER"' EXIT INT TERM HUP
 fi
 if [ -x /usr/local/sbin/update_cron ]; then
   /usr/local/sbin/update_cron >/dev/null 2>&1 || true
 fi
 
 # The banner below prints success either way, so record the real outcome. One
-# predicate, checked once: the two call sites are far apart and must not disagree.
+# predicate, two call sites: they sit far apart and must not disagree.
 cron_ok() { grep -qF 'plugins/pushward-unraid/watchdog.sh' /etc/cron.d/root 2>/dev/null; }
 if cron_ok; then
   logger -t pushward "watchdog cron registered"

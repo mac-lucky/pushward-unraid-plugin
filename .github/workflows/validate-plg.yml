@@ -19,6 +19,13 @@ jobs:
   validate:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    # Every assertion below is a bare test or a `|| { echo; exit 1; }`, so a step that
+    # ran without -u or pipefail would let an unset variable pass as an empty match.
+    # Set once here rather than per step: GitHub's own `shell: bash` gives -eo pipefail
+    # but not -u, and a preamble repeated in every step is one a new step can forget.
+    defaults:
+      run:
+        shell: bash --noprofile --norc -euo pipefail {0}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -26,7 +33,6 @@ jobs:
 
       - name: Check the release version was bumped
         run: |
-          set -euo pipefail
           ver=$(sed -n 's/^VERSION="\([^"]*\)"/\1/p' build-plg.sh); ver=${ver%%$'\n'*}
           printf '%s' "$ver" | grep -qE '^[0-9]{4}\.[0-9]{2}\.[0-9]{2}[a-z]?$' \
             || { echo "::error::VERSION '$ver' is not YYYY.MM.DD with an optional letter suffix"; exit 1; }
@@ -64,7 +70,6 @@ jobs:
 
       - name: Extract the embedded payloads
         run: |
-          set -euo pipefail
           mkdir -p /tmp/plg
           # Extract every <FILE Name="..."> CDATA payload into /tmp/plg/<basename>.
           python3 - <<'PY'
@@ -75,10 +80,17 @@ jobs:
               open('/tmp/plg/' + base, 'w').write(body)
               print('extracted', base)
           PY
+          # Extracting every block is the point, not a side effect: this doubles as the
+          # canary for the <MD5>-outside-<INLINE> invariant, since the regex wants
+          # <INLINE> immediately after the open tag and a hash moved inside it makes the
+          # payload unextractable. Without this count that failure would surface three
+          # steps later as `php -l: Could not open input file`, blaming PHP for it.
+          want=$(grep -c '<FILE Name=' pushward-unraid.plg)
+          got=$(find /tmp/plg -maxdepth 1 -type f | wc -l | tr -d '[:space:]')
+          [ "$got" = "$want" ] || { echo "::error::extracted $got of $want <FILE Name> payloads - is an <MD5> inside its <INLINE>?"; exit 1; }
 
-      - name: Shellcheck the shell scripts
+      - name: Check the shell scripts
         run: |
-          set -euo pipefail
           # Bash scripts: syntax + shellcheck, straight from src/. The drift check
           # above proves the .plg embeds src/ byte for byte, so linting src/ covers
           # the embedded copies - and unlike the extractor above it also reaches the
@@ -92,9 +104,30 @@ jobs:
             shellcheck -s bash "$f"
           done
 
+          # pw_cfg() is duplicated on purpose (a shared file would make the
+          # uninstall path depend on the directory it deletes, and the agent lives on
+          # the flash drive), so pin the copies identical instead of letting them
+          # drift apart one hardening at a time. The list is derived, not spelled out:
+          # by hand it would quietly stop covering the next script that grows a copy.
+          # Matching calls as well as definitions, so a script that ends up calling a
+          # copy it does not carry fails here rather than on a user's box, where the
+          # shell's "command not found" reads as an empty API key and silence. The
+          # pattern is anchored to code so a comment naming pw_cfg does not enlist a
+          # file that neither defines nor calls it.
+          mapfile -t cfgs < <(grep -lE '^pw_cfg\(\) \{|\$\(pw_cfg ' src/*.sh | sort)
+          [ "${#cfgs[@]}" -gt 1 ] || { echo "::error::found ${#cfgs[@]} scripts using pw_cfg() - has it been renamed?"; exit 1; }
+          for f in "${cfgs[@]}"; do
+            grep -q '^pw_cfg() {' "$f" || { echo "::error::$f calls pw_cfg() but ships no copy of it"; exit 1; }
+          done
+          for f in "${cfgs[@]:1}"; do
+            echo "== pw_cfg() in $f matches ${cfgs[0]} =="
+            # diff and not a hash: a red build here exists to show what drifted.
+            diff -u <(awk '/^pw_cfg\(\) \{/,/^\}/' "${cfgs[0]}") <(awk '/^pw_cfg\(\) \{/,/^\}/' "$f") \
+              || { echo "::error::pw_cfg() in $f has drifted from ${cfgs[0]}"; exit 1; }
+          done
+
       - name: Run the install and uninstall blocks
         run: |
-          set -euo pipefail
           # Unraid aborts the whole install and files the .plg under plugins-error if
           # a <FILE Run> block exits non-zero, so run post-install.sh and remove.sh
           # and check the status. A textual "ends with exit 0" check passes a script
@@ -108,9 +141,18 @@ jobs:
           echo "== post-install.sh and remove.sh exit 0, and clean up after themselves =="
           docker run --rm -v "$PWD/src:/src:ro" ubuntu:24.04 bash -c '
             set -u
+            # Stub update_cron so the run can assert the marker was in place while it
+            # ran, which is the entire point of standing one up. Asserting only that the
+            # marker was cleaned up afterwards is satisfied by never creating it, so a
+            # regression that dropped the ln -s would pass green. post-install.sh
+            # silences update_cron, hence a file rather than its output.
+            mkdir -p /usr/local/sbin
+            printf "#!/bin/bash\n[ -L /var/log/plugins/pushward-unraid.plg ] && echo visible > /tmp/marker.seen\n" > /usr/local/sbin/update_cron
+            chmod +x /usr/local/sbin/update_cron
             bash /src/post-install.sh >/tmp/pi.log 2>&1 || { echo "post-install.sh exited $?"; cat /tmp/pi.log; exit 1; }
             grep -q "PushWard Unraid plugin installed" /tmp/pi.log || { echo "no install banner"; exit 1; }
             grep -q "watchdog cron is not registered" /tmp/pi.log || { echo "missing-cron warning not printed"; exit 1; }
+            [ -f /tmp/marker.seen ] || { echo "update_cron ran with no marker in place, so a first install would drop the watchdog cron"; exit 1; }
             if [ -e /var/log/plugins/pushward-unraid.plg ] || [ -L /var/log/plugins/pushward-unraid.plg ]; then
               echo "temporary marker left behind in /var/log/plugins"; exit 1
             fi
@@ -120,7 +162,6 @@ jobs:
 
       - name: Check the plugin wiring invariants
         run: |
-          set -euo pipefail
           # Every #command a settings page posts must be shipped, and shipped
           # executable - a 0644 #command dies in popen() as another silent dead
           # button. Derived from the page, because a hand-written list is exactly
@@ -132,18 +173,6 @@ jobs:
             echo "== $cmd is shipped Mode=0755 =="
             grep -qF "<FILE Name=\"$cmd\" Mode=\"0755\">" pushward-unraid.plg \
               || { echo "::error::$cmd is posted by a settings page but not shipped Mode=0755"; exit 1; }
-          done
-
-          # pw_cfg() is duplicated on purpose (a shared file would make the
-          # uninstall path depend on the directory it deletes, and the agent lives on
-          # the flash drive), so pin the copies identical instead of letting them
-          # drift apart one hardening at a time.
-          echo "== the pw_cfg() copies are identical =="
-          ref=""
-          for f in src/watchdog.sh src/agent-PushWard.sh src/apply.sh; do
-            h=$(awk '/^pw_cfg\(\) \{/,/^\}/' "$f" | md5sum | cut -d' ' -f1)
-            if [ -z "$ref" ]; then ref="$h"; fi
-            [ "$h" = "$ref" ] || { echo "::error::pw_cfg() in $f has drifted from the other copies"; exit 1; }
           done
 
           # Every <FILE Name> block needs an <MD5>, or Unraid silently never
@@ -181,7 +210,6 @@ jobs:
 
       - name: Lint PHP and the page JS
         run: |
-          set -euo pipefail
           # PHP files: lint. The .page files have a "header\n---\nbody" layout;
           # strip the header so only the PHP/HTML body is linted.
           for f in pushward-monitor.php pwapi.php; do

@@ -3,7 +3,7 @@
 <!DOCTYPE PLUGIN [
 <!ENTITY name      "pushward-unraid">
 <!ENTITY author    "mac-lucky">
-<!ENTITY version   "2026.07.30c">
+<!ENTITY version   "2026.07.30d">
 <!ENTITY gitURL    "https://github.com/mac-lucky/pushward-unraid-plugin">
 <!ENTITY pluginURL "&gitURL;/raw/main/pushward-unraid.plg">
 <!ENTITY supportURL "&gitURL;/issues">
@@ -18,7 +18,7 @@
         min="6.12">
 
 <CHANGES>
-###2026.07.30c
+###2026.07.30d
 - Internal tidy-up only: no behaviour changes
 ###2026.07.30b
 - Honour a Live Activities "Disabled" setting saved from a Windows editor: a carriage return in the config file made the monitor read the value as enabled and start anyway
@@ -223,7 +223,8 @@ exit 0
 # verify their config without waiting for a real Unraid event.
 AGENT="/boot/config/plugins/dynamix/notifications/agents/PushWard"
 if [ ! -f "$AGENT" ]; then
-  # Not >&2: update.php shows only stdout (see CLAUDE.md).
+  # Not >&2: Unraid runs this through popen($cmd,'r') and echoes only stdout into
+  # the progress window, so a message on stderr would be lost.
   echo "PushWard agent not installed at $AGENT. Reinstall the plugin."
   exit 1
 fi
@@ -238,7 +239,7 @@ bash "$AGENT"
 echo "Test notification sent to PushWard. Check your device."
 ]]>
 </INLINE>
-<MD5>f9d33fd08e693287092a5fa8bc7c1659</MD5>
+<MD5>4213c075cf7ab3b2766e675879c318c3</MD5>
 </FILE>
 
 <!-- 4. Live Activity monitor daemon. -->
@@ -1938,14 +1939,15 @@ switch ($action) {
 # straight from Settings -> PushWard.
 MON="/usr/local/emhttp/plugins/pushward-unraid/pushward-monitor.php"
 if [ ! -f "$MON" ]; then
-  # Not >&2: update.php shows only stdout (see CLAUDE.md).
+  # Not >&2: Unraid runs this through popen($cmd,'r') and echoes only stdout into
+  # the progress window, so a message on stderr would be lost.
   echo "PushWard monitor not installed at $MON. Reinstall the plugin."
   exit 1
 fi
 php "$MON" test-activity
 ]]>
 </INLINE>
-<MD5>cd0c399f4d860dd5d2fc978fa9589dd9</MD5>
+<MD5>f5e6b7845dd319490cc001e5dd5004bc</MD5>
 </FILE>
 
 <!-- 7a. Apply / Start monitor helper (Settings page buttons): register cron, start monitor. -->
@@ -2244,7 +2246,7 @@ if ($configured) {
     }
 }
 function pw_chip_icon($cls) {
-    static $icons = [
+    static $icons = [   // static, unlike the tables above: this one runs once per chip
         'ok'   => '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>',
         'bad'  => '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><line x1="9" y1="9" x2="15" y2="15"/><line x1="15" y1="9" x2="9" y2="15"/></svg>',
         'warn' => '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><line x1="12" y1="8" x2="12" y2="13"/><line x1="12" y1="16" x2="12" y2="16.5"/></svg>',
@@ -2447,7 +2449,7 @@ function pwKeepKey() {
 </script>
 ]]>
 </INLINE>
-<MD5>6a4933895882d9462df8ef14766e7177</MD5>
+<MD5>9577612acb221607fd0edd5857c05c44</MD5>
 </FILE>
 
 <!-- 11. Activities tab page (live dashboard). -->
@@ -2795,24 +2797,22 @@ pkill -KILL -f "$PAT" 2>/dev/null || true
 # Register the watchdog cron. update_cron reads a plugin's .cron only once Unraid
 # has marked it installed in /var/log/plugins, and that happens AFTER these scripts
 # run - so on a first install ours is invisible and the monitor never starts. Its
-# glob matches the directory entry without stating the target, so a marker we stand
+# glob matches the directory entry and never stats the target, so a marker we stand
 # up here works even before the .plg is copied to /boot. -e alone is false for a
 # dangling symlink, hence -e and -L: only an empty path is ours to take back down.
 # The cleanup must stay in a trap - a marker left behind by a signal dangles, and
 # Unraid then refuses to install or update the plugin until the box reboots.
 MARKER="/var/log/plugins/pushward-unraid.plg"
-if [ ! -e "$MARKER" ] && [ ! -L "$MARKER" ]; then
-  mkdir -p /var/log/plugins
-  if ln -s /boot/config/plugins/pushward-unraid.plg "$MARKER" 2>/dev/null; then
-    trap 'rm -f "$MARKER"' EXIT INT TERM HUP
-  fi
+mkdir -p /var/log/plugins
+if [ ! -e "$MARKER" ] && [ ! -L "$MARKER" ] && ln -s /boot/config/plugins/pushward-unraid.plg "$MARKER" 2>/dev/null; then
+  trap 'rm -f "$MARKER"' EXIT INT TERM HUP
 fi
 if [ -x /usr/local/sbin/update_cron ]; then
   /usr/local/sbin/update_cron >/dev/null 2>&1 || true
 fi
 
 # The banner below prints success either way, so record the real outcome. One
-# predicate, checked once: the two call sites are far apart and must not disagree.
+# predicate, two call sites: they sit far apart and must not disagree.
 cron_ok() { grep -qF 'plugins/pushward-unraid/watchdog.sh' /etc/cron.d/root 2>/dev/null; }
 if cron_ok; then
   logger -t pushward "watchdog cron registered"
