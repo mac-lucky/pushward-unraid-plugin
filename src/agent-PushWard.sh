@@ -15,8 +15,8 @@ CFG="/boot/config/plugins/pushward-unraid/pushward-unraid.cfg"
 pw_cfg() {  # $1 = key -> value with surrounding quotes stripped
   local v
   v="$(grep -E "^[[:space:]]*$1[[:space:]]*=" "$CFG" 2>/dev/null | tail -n1 | cut -d= -f2-)"
-  v="${v%$'\r'}"                   # /boot is vfat: a Windows editor leaves a CR here,
-                                   # which would otherwise ride along into the URL
+  v="${v%$'\r'}"                   # the .cfg is on vfat, so a Windows editor leaves a
+                                   # CR that would otherwise ride along into the value
   v="${v#"${v%%[![:space:]]*}"}"   # trim around the value, never inside it, so a
   v="${v%"${v##*[![:space:]]}"}"   # deliberate space in the server name survives
   v="${v%\"}"; v="${v#\"}"

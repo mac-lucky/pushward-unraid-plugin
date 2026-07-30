@@ -62,7 +62,7 @@ jobs:
       - name: Validate XML
         run: xmllint --noout pushward-unraid.plg
 
-      - name: Extract, shellcheck and php-lint the embedded scripts
+      - name: Extract the embedded payloads
         run: |
           set -euo pipefail
           mkdir -p /tmp/plg
@@ -76,6 +76,9 @@ jobs:
               print('extracted', base)
           PY
 
+      - name: Shellcheck the shell scripts
+        run: |
+          set -euo pipefail
           # Bash scripts: syntax + shellcheck, straight from src/. The drift check
           # above proves the .plg embeds src/ byte for byte, so linting src/ covers
           # the embedded copies - and unlike the extractor above it also reaches the
@@ -89,6 +92,9 @@ jobs:
             shellcheck -s bash "$f"
           done
 
+      - name: Run the install and uninstall blocks
+        run: |
+          set -euo pipefail
           # Unraid aborts the whole install and files the .plg under plugins-error if
           # a <FILE Run> block exits non-zero, so run post-install.sh and remove.sh
           # and check the status. A textual "ends with exit 0" check passes a script
@@ -112,6 +118,9 @@ jobs:
             bash /src/remove.sh >/dev/null 2>&1 || { echo "remove.sh exited $?"; exit 1; }
           ' || { echo "::error::an install/uninstall Run block misbehaved; Unraid would report a failed install"; exit 1; }
 
+      - name: Check the plugin wiring invariants
+        run: |
+          set -euo pipefail
           # Every #command a settings page posts must be shipped, and shipped
           # executable - a 0644 #command dies in popen() as another silent dead
           # button. Derived from the page, because a hand-written list is exactly
@@ -123,6 +132,18 @@ jobs:
             echo "== $cmd is shipped Mode=0755 =="
             grep -qF "<FILE Name=\"$cmd\" Mode=\"0755\">" pushward-unraid.plg \
               || { echo "::error::$cmd is posted by a settings page but not shipped Mode=0755"; exit 1; }
+          done
+
+          # pw_cfg() is duplicated on purpose (a shared file would make the
+          # uninstall path depend on the directory it deletes, and the agent lives on
+          # the flash drive), so pin the copies identical instead of letting them
+          # drift apart one hardening at a time.
+          echo "== the pw_cfg() copies are identical =="
+          ref=""
+          for f in src/watchdog.sh src/agent-PushWard.sh src/apply.sh; do
+            h=$(awk '/^pw_cfg\(\) \{/,/^\}/' "$f" | md5sum | cut -d' ' -f1)
+            if [ -z "$ref" ]; then ref="$h"; fi
+            [ "$h" = "$ref" ] || { echo "::error::pw_cfg() in $f has drifted from the other copies"; exit 1; }
           done
 
           # Every <FILE Name> block needs an <MD5>, or Unraid silently never
@@ -158,6 +179,9 @@ jobs:
               || { echo "::error::pattern [$p] does not match the launched argv [$argv]"; exit 1; }
           done
 
+      - name: Lint PHP and the page JS
+        run: |
+          set -euo pipefail
           # PHP files: lint. The .page files have a "header\n---\nbody" layout;
           # strip the header so only the PHP/HTML body is linted.
           for f in pushward-monitor.php pwapi.php; do

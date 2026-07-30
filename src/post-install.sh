@@ -12,22 +12,14 @@ for _ in $(seq 1 30); do
 done
 pkill -KILL -f "$PAT" 2>/dev/null || true
 
-# Register the watchdog cron. update_cron reads the .cron files only of plugins it
-# finds marked installed in /var/log/plugins, and Unraid creates that marker only
-# AFTER these install scripts finish - so on a first install ours is invisible to
-# it, the watchdog line never reaches /etc/cron.d/root, and nothing ever starts the
-# monitor. Stand the marker up for the call, then drop it again so the plugin
-# manager can create the real one itself. Its glob matches the directory entry and
-# never stats the target, so this works even though the .plg has not been copied to
-# /boot yet. Testing both -e and -L because -e alone is false for a dangling
-# symlink: only a path with nothing on it is ours to create and take back down.
-# (Known Unraid issue; the community alternative is to defer the update_cron call
-# with `at now`, but that returns before the outcome is known, so this script could
-# no longer report it.) The trap matters: if a signal lands while update_cron is
-# reading the plugin .cron files off the flash drive, a marker left behind would
-# dangle - and Unraid then reads it, takes the re-install branch, fails to read a
-# version from the .plg it never copied, and refuses to install or update the
-# plugin until the box reboots.
+# Register the watchdog cron. update_cron reads a plugin's .cron only once Unraid
+# has marked it installed in /var/log/plugins, and that happens AFTER these scripts
+# run - so on a first install ours is invisible and the monitor never starts. Its
+# glob matches the directory entry without stating the target, so a marker we stand
+# up here works even before the .plg is copied to /boot. -e alone is false for a
+# dangling symlink, hence -e and -L: only an empty path is ours to take back down.
+# The cleanup must stay in a trap - a marker left behind by a signal dangles, and
+# Unraid then refuses to install or update the plugin until the box reboots.
 MARKER="/var/log/plugins/pushward-unraid.plg"
 if [ ! -e "$MARKER" ] && [ ! -L "$MARKER" ]; then
   mkdir -p /var/log/plugins

@@ -4,7 +4,7 @@
 set -euo pipefail
 SRC="$(cd "$(dirname "$0")/src" && pwd)"
 OUT="${1:-$(dirname "$0")/pushward-unraid.plg}"
-VERSION="2026.07.30b"
+VERSION="2026.07.30c"
 
 # Guard: a literal ]]> in any embedded TEXT file would break its CDATA section.
 # Skip *.png: the icon is base64-encoded (icon_file), never embedded raw, so a
@@ -75,6 +75,8 @@ cat <<XMLHEAD
 
 <CHANGES>
 ###$VERSION
+- Internal tidy-up only: no behaviour changes
+###2026.07.30b
 - Honour a Live Activities "Disabled" setting saved from a Windows editor: a carriage return in the config file made the monitor read the value as enabled and start anyway
 - Never leave a stray marker behind if the box is shut down mid-install, which could make the plugin refuse to install or update until a reboot
 - The notification status card now resolves which importance levels reach the agent the same way Unraid itself does

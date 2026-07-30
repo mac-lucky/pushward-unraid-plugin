@@ -3,7 +3,7 @@
 <!DOCTYPE PLUGIN [
 <!ENTITY name      "pushward-unraid">
 <!ENTITY author    "mac-lucky">
-<!ENTITY version   "2026.07.30b">
+<!ENTITY version   "2026.07.30c">
 <!ENTITY gitURL    "https://github.com/mac-lucky/pushward-unraid-plugin">
 <!ENTITY pluginURL "&gitURL;/raw/main/pushward-unraid.plg">
 <!ENTITY supportURL "&gitURL;/issues">
@@ -18,6 +18,8 @@
         min="6.12">
 
 <CHANGES>
+###2026.07.30c
+- Internal tidy-up only: no behaviour changes
 ###2026.07.30b
 - Honour a Live Activities "Disabled" setting saved from a Windows editor: a carriage return in the config file made the monitor read the value as enabled and start anyway
 - Never leave a stray marker behind if the box is shut down mid-install, which could make the plugin refuse to install or update until a reboot
@@ -130,8 +132,8 @@ CFG="/boot/config/plugins/pushward-unraid/pushward-unraid.cfg"
 pw_cfg() {  # $1 = key -> value with surrounding quotes stripped
   local v
   v="$(grep -E "^[[:space:]]*$1[[:space:]]*=" "$CFG" 2>/dev/null | tail -n1 | cut -d= -f2-)"
-  v="${v%$'\r'}"                   # /boot is vfat: a Windows editor leaves a CR here,
-                                   # which would otherwise ride along into the URL
+  v="${v%$'\r'}"                   # the .cfg is on vfat, so a Windows editor leaves a
+                                   # CR that would otherwise ride along into the value
   v="${v#"${v%%[![:space:]]*}"}"   # trim around the value, never inside it, so a
   v="${v%"${v##*[![:space:]]}"}"   # deliberate space in the server name survives
   v="${v%\"}"; v="${v#\"}"
@@ -210,7 +212,7 @@ fi
 exit 0
 ]]>
 </INLINE>
-<MD5>519b90152b4d03619bcb8c22ffe3fc36</MD5>
+<MD5>a21279596f705a8d57db50529f39a77c</MD5>
 </FILE>
 
 <!-- 3. Test-notification helper (Settings page button). -->
@@ -221,7 +223,7 @@ exit 0
 # verify their config without waiting for a real Unraid event.
 AGENT="/boot/config/plugins/dynamix/notifications/agents/PushWard"
 if [ ! -f "$AGENT" ]; then
-  # update.php echoes only stdout into the progress window, so not >&2.
+  # Not >&2: update.php shows only stdout (see CLAUDE.md).
   echo "PushWard agent not installed at $AGENT. Reinstall the plugin."
   exit 1
 fi
@@ -236,7 +238,7 @@ bash "$AGENT"
 echo "Test notification sent to PushWard. Check your device."
 ]]>
 </INLINE>
-<MD5>5145d5e6018dc60c4287680ffee57292</MD5>
+<MD5>f9d33fd08e693287092a5fa8bc7c1659</MD5>
 </FILE>
 
 <!-- 4. Live Activity monitor daemon. -->
@@ -1742,9 +1744,8 @@ MON="/usr/local/emhttp/plugins/pushward-unraid/pushward-monitor.php"
 pw_cfg() {  # $1 = key -> value with surrounding quotes stripped
   local v
   v="$(grep -E "^[[:space:]]*$1[[:space:]]*=" "$CFG" 2>/dev/null | tail -n1 | cut -d= -f2-)"
-  v="${v%$'\r'}"                   # /boot is vfat: a Windows editor leaves a CR here,
-                                   # and then "false" reads back as false" and a
-                                   # disabled monitor would start anyway
+  v="${v%$'\r'}"                   # the .cfg is on vfat, so a Windows editor leaves a
+                                   # CR that would otherwise ride along into the value
   v="${v#"${v%%[![:space:]]*}"}"   # trim around the value, never inside it, so a
   v="${v%"${v##*[![:space:]]}"}"   # deliberate space in the server name survives
   v="${v%\"}"; v="${v#\"}"
@@ -1766,7 +1767,7 @@ setsid php "$MON" daemon >/dev/null 2>&1 &
 exit 0
 ]]>
 </INLINE>
-<MD5>3f805e8c6c622e5747209ca00a9d572b</MD5>
+<MD5>8e1a19df1a621b4239d7b46331378e0b</MD5>
 </FILE>
 
 <!-- 6. Dashboard server-side proxy (keeps the key off the browser). -->
@@ -1937,14 +1938,14 @@ switch ($action) {
 # straight from Settings -> PushWard.
 MON="/usr/local/emhttp/plugins/pushward-unraid/pushward-monitor.php"
 if [ ! -f "$MON" ]; then
-  # update.php echoes only stdout into the progress window, so not >&2.
+  # Not >&2: update.php shows only stdout (see CLAUDE.md).
   echo "PushWard monitor not installed at $MON. Reinstall the plugin."
   exit 1
 fi
 php "$MON" test-activity
 ]]>
 </INLINE>
-<MD5>0bdaa6b4e956dde83a29ef6a73a66123</MD5>
+<MD5>cd0c399f4d860dd5d2fc978fa9589dd9</MD5>
 </FILE>
 
 <!-- 7a. Apply / Start monitor helper (Settings page buttons): register cron, start monitor. -->
@@ -1982,9 +1983,8 @@ PAT="pushward-monitor[.]php daemon"
 pw_cfg() {  # $1 = key -> value with surrounding quotes stripped
   local v
   v="$(grep -E "^[[:space:]]*$1[[:space:]]*=" "$CFG" 2>/dev/null | tail -n1 | cut -d= -f2-)"
-  v="${v%$'\r'}"                   # /boot is vfat: a Windows editor leaves a CR here,
-                                   # and then "false" reads back as false" and a
-                                   # disabled monitor would start anyway
+  v="${v%$'\r'}"                   # the .cfg is on vfat, so a Windows editor leaves a
+                                   # CR that would otherwise ride along into the value
   v="${v#"${v%%[![:space:]]*}"}"   # trim around the value, never inside it, so a
   v="${v%"${v##*[![:space:]]}"}"   # deliberate space in the server name survives
   v="${v%\"}"; v="${v#\"}"
@@ -2053,7 +2053,7 @@ fi
 exit 0
 ]]>
 </INLINE>
-<MD5>25294b590d589c5d1ab24de066654f87</MD5>
+<MD5>861eb0f7ce0dbf2e60ac755e90a5fc9b</MD5>
 </FILE>
 
 <!-- 8. Array event: start the monitor when disks mount. -->
@@ -2166,7 +2166,7 @@ function pw_monitor_state($activities, $daemon, $cronOk) {
     return $cronOk ? 'pending' : 'stuck';
 }
 function pw_monitor_chip($state) {
-    static $t = [
+    $t = [
         'off'     => ['warn', 'Disabled',    'Live Activities are off'],
         'running' => ['ok',   'Running',     ''],
         'no-net'  => ['warn', 'Running',     'watchdog cron missing'],
@@ -2177,7 +2177,7 @@ function pw_monitor_chip($state) {
     return ['label' => 'Monitor daemon', 'state' => $s, 'value' => $v, 'sub' => $sub];
 }
 function pw_log_note($state) {
-    static $t = [
+    $t = [
         'off'     => 'No log yet: Live Activities are set to Disabled.',
         'running' => 'Monitor running, no log lines yet.',
         'no-net'  => 'Monitor running, no log lines yet.',
@@ -2447,7 +2447,7 @@ function pwKeepKey() {
 </script>
 ]]>
 </INLINE>
-<MD5>f1e81cec41396aa195cf542df2bcb598</MD5>
+<MD5>6a4933895882d9462df8ef14766e7177</MD5>
 </FILE>
 
 <!-- 11. Activities tab page (live dashboard). -->
@@ -2792,22 +2792,14 @@ for _ in $(seq 1 30); do
 done
 pkill -KILL -f "$PAT" 2>/dev/null || true
 
-# Register the watchdog cron. update_cron reads the .cron files only of plugins it
-# finds marked installed in /var/log/plugins, and Unraid creates that marker only
-# AFTER these install scripts finish - so on a first install ours is invisible to
-# it, the watchdog line never reaches /etc/cron.d/root, and nothing ever starts the
-# monitor. Stand the marker up for the call, then drop it again so the plugin
-# manager can create the real one itself. Its glob matches the directory entry and
-# never stats the target, so this works even though the .plg has not been copied to
-# /boot yet. Testing both -e and -L because -e alone is false for a dangling
-# symlink: only a path with nothing on it is ours to create and take back down.
-# (Known Unraid issue; the community alternative is to defer the update_cron call
-# with `at now`, but that returns before the outcome is known, so this script could
-# no longer report it.) The trap matters: if a signal lands while update_cron is
-# reading the plugin .cron files off the flash drive, a marker left behind would
-# dangle - and Unraid then reads it, takes the re-install branch, fails to read a
-# version from the .plg it never copied, and refuses to install or update the
-# plugin until the box reboots.
+# Register the watchdog cron. update_cron reads a plugin's .cron only once Unraid
+# has marked it installed in /var/log/plugins, and that happens AFTER these scripts
+# run - so on a first install ours is invisible and the monitor never starts. Its
+# glob matches the directory entry without stating the target, so a marker we stand
+# up here works even before the .plg is copied to /boot. -e alone is false for a
+# dangling symlink, hence -e and -L: only an empty path is ours to take back down.
+# The cleanup must stay in a trap - a marker left behind by a signal dangles, and
+# Unraid then refuses to install or update the plugin until the box reboots.
 MARKER="/var/log/plugins/pushward-unraid.plg"
 if [ ! -e "$MARKER" ] && [ ! -L "$MARKER" ]; then
   mkdir -p /var/log/plugins

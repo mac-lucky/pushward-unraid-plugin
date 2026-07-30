@@ -30,9 +30,8 @@ PAT="pushward-monitor[.]php daemon"
 pw_cfg() {  # $1 = key -> value with surrounding quotes stripped
   local v
   v="$(grep -E "^[[:space:]]*$1[[:space:]]*=" "$CFG" 2>/dev/null | tail -n1 | cut -d= -f2-)"
-  v="${v%$'\r'}"                   # /boot is vfat: a Windows editor leaves a CR here,
-                                   # and then "false" reads back as false" and a
-                                   # disabled monitor would start anyway
+  v="${v%$'\r'}"                   # the .cfg is on vfat, so a Windows editor leaves a
+                                   # CR that would otherwise ride along into the value
   v="${v#"${v%%[![:space:]]*}"}"   # trim around the value, never inside it, so a
   v="${v%"${v##*[![:space:]]}"}"   # deliberate space in the server name survives
   v="${v%\"}"; v="${v#\"}"

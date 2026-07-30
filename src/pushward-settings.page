@@ -52,7 +52,7 @@ function pw_monitor_state($activities, $daemon, $cronOk) {
     return $cronOk ? 'pending' : 'stuck';
 }
 function pw_monitor_chip($state) {
-    static $t = [
+    $t = [
         'off'     => ['warn', 'Disabled',    'Live Activities are off'],
         'running' => ['ok',   'Running',     ''],
         'no-net'  => ['warn', 'Running',     'watchdog cron missing'],
@@ -63,7 +63,7 @@ function pw_monitor_chip($state) {
     return ['label' => 'Monitor daemon', 'state' => $s, 'value' => $v, 'sub' => $sub];
 }
 function pw_log_note($state) {
-    static $t = [
+    $t = [
         'off'     => 'No log yet: Live Activities are set to Disabled.',
         'running' => 'Monitor running, no log lines yet.',
         'no-net'  => 'Monitor running, no log lines yet.',
