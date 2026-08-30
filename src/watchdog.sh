@@ -23,9 +23,15 @@ pw_cfg() {  # $1 = key -> value with surrounding quotes stripped
 }
 PUSHWARD_API_KEY="$(pw_cfg PUSHWARD_API_KEY)"
 PUSHWARD_ACTIVITIES_ENABLED="$(pw_cfg PUSHWARD_ACTIVITIES_ENABLED)"
+PUSHWARD_WIDGETS_ENABLED="$(pw_cfg PUSHWARD_WIDGETS_ENABLED)"
 
 [ -n "${PUSHWARD_API_KEY:-}" ] || exit 0
-[ "${PUSHWARD_ACTIVITIES_ENABLED:-true}" = "false" ] && exit 0
+# The daemon serves both surfaces, so it runs while either is on. The defaults
+# are deliberately asymmetric: activities default on when the key is absent (an
+# upgraded box's .cfg predates the widget key), widgets need the literal "true".
+if [ "${PUSHWARD_ACTIVITIES_ENABLED:-true}" = "false" ] && [ "${PUSHWARD_WIDGETS_ENABLED:-false}" != "true" ]; then
+  exit 0
+fi
 [ -f "$MON" ] || exit 0
 
 if pgrep -f "pushward-monitor[.]php daemon" >/dev/null 2>&1; then

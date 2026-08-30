@@ -14,11 +14,29 @@ function pw_val($cfg, $key, $default = '') {
 function pw_enabled($cfg, $key, $default = 'true') {
     return ($cfg[$key] ?? $default) !== 'false';  // only the literal "false" is off
 }
-function pw_yesno($cfg, $key, $default) {
-    $v = pw_enabled($cfg, $key, $default);
-    $t = $v ? ' selected' : '';
-    $f = $v ? '' : ' selected';
-    return "<option value='true'$t>Enabled</option><option value='false'$f>Disabled</option>";
+// One <option> list from a value => label map, with the stored value selected.
+// A value that is not in the map falls back to $default instead of to "on":
+// pw_enabled's "anything but the literal false" suits the activity toggles but
+// not the widgets, where the daemon and watchdog want the literal "true", so an
+// empty value rendered Enabled here while every consumer read it as off. The
+// default map is the on/off pair; the alert level brings its own three.
+function pw_options($cfg, $key, $default, array $opts = ['true' => 'Enabled', 'false' => 'Disabled']) {
+    $cur = (string) ($cfg[$key] ?? $default);
+    if (!isset($opts[$cur])) { $cur = $default; }
+    $out = '';
+    foreach ($opts as $v => $label) {
+        $sel = $v === $cur ? ' selected' : '';
+        $out .= "<option value='$v'$sel>$label</option>";
+    }
+    return $out;
+}
+// Placeholder for the web UI URL field: the base URL the "Open" button on a Live
+// Activity points at when the field is blank, so the operator can see what
+// auto-detection resolved to. Returns the finished, escaped text.
+function pw_webui_placeholder() {
+    $ini = @parse_ini_file('/var/local/emhttp/nginx.ini') ?: [];
+    $auto = (string) ($ini['NGINX_DEFAULTURL'] ?? '');
+    return $auto === '' ? 'auto' : 'auto (' . htmlspecialchars($auto, ENT_QUOTES) . ')';
 }
 
 // Which importances dynamix actually hands to notification agents. In each level's
@@ -43,17 +61,21 @@ function pw_notify_agent_levels() {
 }
 
 // One derivation of the monitor's situation, so the status chip and the log-panel
-// note cannot contradict each other. Red is reserved for the state that cannot heal
-// itself: with no watchdog line in cron nothing will ever start the daemon. Running
-// without the cron is only a warning - it works now, but has no restart net.
-function pw_monitor_state($activities, $daemon, $cronOk) {
-    if (!$activities) { return 'off'; }
+// note cannot contradict each other. $wanted is "either surface is switched on",
+// the same condition watchdog.sh and the daemon use to decide whether to run:
+// the daemon serves widgets too, so keying on Live Activities alone reported it
+// Disabled while it was up and publishing, and apply.sh said the opposite on the
+// same button press. Red is reserved for the state that cannot heal itself: with
+// no watchdog line in cron nothing will ever start the daemon. Running without
+// the cron is only a warning - it works now, but has no restart net.
+function pw_monitor_state($wanted, $daemon, $cronOk) {
+    if (!$wanted)     { return 'off'; }
     if ($daemon)      { return $cronOk ? 'running' : 'no-net'; }
     return $cronOk ? 'pending' : 'stuck';
 }
 function pw_monitor_chip($state) {
     $t = [
-        'off'     => ['warn', 'Disabled',    'Live Activities are off'],
+        'off'     => ['warn', 'Disabled',    'activities and widgets are off'],
         'running' => ['ok',   'Running',     ''],
         'no-net'  => ['warn', 'Running',     'watchdog cron missing'],
         'pending' => ['warn', 'Not running', 'starts within a minute'],
@@ -64,7 +86,7 @@ function pw_monitor_chip($state) {
 }
 function pw_log_note($state) {
     $t = [
-        'off'     => 'No log yet: Live Activities are set to Disabled.',
+        'off'     => 'No log yet: Live Activities and Home Screen widgets are both Disabled.',
         'running' => 'Monitor running, no log lines yet.',
         'no-net'  => 'Monitor running, no log lines yet.',
         'pending' => 'No log yet: the watchdog starts the monitor within a minute. Reload this page.',
@@ -74,6 +96,9 @@ function pw_log_note($state) {
 }
 $configured = !empty($cfg['PUSHWARD_API_KEY']);
 $activities = pw_enabled($cfg, 'PUSHWARD_ACTIVITIES_ENABLED');
+// Widgets read with the daemon's polarity, not pw_enabled's: watchdog.sh and the
+// daemon both start only on the literal "true".
+$widgets = ($cfg['PUSHWARD_WIDGETS_ENABLED'] ?? 'false') === 'true';
 
 // Live status (best-effort, short timeouts so the page never hangs).
 $me = null; $actCode = 0; $daemon = false; $cronOk = false; $logTail = ''; $monState = 'off';
@@ -96,7 +121,7 @@ if ($configured) {
     // update_cron merges the plugin cron files into /etc/cron.d/root, so read that
     // file rather than shelling out again.
     $cronOk = str_contains((string) @file_get_contents('/etc/cron.d/root'), "plugins/{$plugin}/watchdog.sh");
-    $monState = pw_monitor_state($activities, $daemon, $cronOk);
+    $monState = pw_monitor_state($activities || $widgets, $daemon, $cronOk);
     if (is_file('/var/log/pushward-monitor.log')) {
         $logTail = htmlspecialchars(implode('', array_slice((array) @file('/var/log/pushward-monitor.log'), -10)), ENT_QUOTES);
     }
@@ -214,29 +239,41 @@ PushWard API key:
 Server display name:
 : <input type="text" name="PUSHWARD_SERVER_NAME" maxlength="100" value="<?= pw_val($cfg,'PUSHWARD_SERVER_NAME','Unraid') ?>">
 
+Alert notification level:
+: <select name="PUSHWARD_ALERT_LEVEL"><?= pw_options($cfg, 'PUSHWARD_ALERT_LEVEL', 'time-sensitive', ['active' => 'Normal', 'time-sensitive' => 'Time Sensitive', 'critical' => 'Critical']) ?></select>
+
 Live Activities:
-: <select name="PUSHWARD_ACTIVITIES_ENABLED"><?= pw_yesno($cfg,'PUSHWARD_ACTIVITIES_ENABLED','true') ?></select>
+: <select name="PUSHWARD_ACTIVITIES_ENABLED"><?= pw_options($cfg,'PUSHWARD_ACTIVITIES_ENABLED','true') ?></select>
 
 Track parity check / rebuild:
-: <select name="PUSHWARD_TRACK_PARITY"><?= pw_yesno($cfg,'PUSHWARD_TRACK_PARITY','true') ?></select>
+: <select name="PUSHWARD_TRACK_PARITY"><?= pw_options($cfg,'PUSHWARD_TRACK_PARITY','true') ?></select>
 
 Track appdata backup:
-: <select name="PUSHWARD_TRACK_BACKUP"><?= pw_yesno($cfg,'PUSHWARD_TRACK_BACKUP','true') ?></select>
+: <select name="PUSHWARD_TRACK_BACKUP"><?= pw_options($cfg,'PUSHWARD_TRACK_BACKUP','true') ?></select>
 
 Track mover:
-: <select name="PUSHWARD_TRACK_MOVER"><?= pw_yesno($cfg,'PUSHWARD_TRACK_MOVER','true') ?></select>
+: <select name="PUSHWARD_TRACK_MOVER"><?= pw_options($cfg,'PUSHWARD_TRACK_MOVER','true') ?></select>
 
 Track VM backup:
-: <select name="PUSHWARD_TRACK_VMBACKUP"><?= pw_yesno($cfg,'PUSHWARD_TRACK_VMBACKUP','true') ?></select>
+: <select name="PUSHWARD_TRACK_VMBACKUP"><?= pw_options($cfg,'PUSHWARD_TRACK_VMBACKUP','true') ?></select>
 
 Track UPS on battery:
-: <select name="PUSHWARD_TRACK_UPS"><?= pw_yesno($cfg,'PUSHWARD_TRACK_UPS','true') ?></select>
+: <select name="PUSHWARD_TRACK_UPS"><?= pw_options($cfg,'PUSHWARD_TRACK_UPS','true') ?></select>
 
 Poll interval (seconds):
 : <input type="number" name="PUSHWARD_POLL_INTERVAL" min="5" max="300" value="<?= pw_val($cfg,'PUSHWARD_POLL_INTERVAL','15') ?>">
 
 Activity priority (0-10):
 : <input type="number" name="PUSHWARD_ACTIVITY_PRIORITY" min="0" max="10" value="<?= pw_val($cfg,'PUSHWARD_ACTIVITY_PRIORITY','5') ?>">
+
+Unraid web UI URL:
+: <input type="text" name="PUSHWARD_WEBUI_URL" maxlength="200" placeholder="<?= pw_webui_placeholder() ?>" value="<?= pw_val($cfg,'PUSHWARD_WEBUI_URL') ?>">
+
+Home Screen widgets:
+: <select name="PUSHWARD_WIDGETS_ENABLED"><?= pw_options($cfg,'PUSHWARD_WIDGETS_ENABLED','false') ?></select>
+
+Widget refresh interval (seconds):
+: <input type="number" name="PUSHWARD_WIDGET_INTERVAL" min="60" max="3600" value="<?= pw_val($cfg,'PUSHWARD_WIDGET_INTERVAL','300') ?>">
 
 &nbsp;
 : <input type="submit" name="apply" value="Apply"> <input type="button" value="Done" onclick="done()">

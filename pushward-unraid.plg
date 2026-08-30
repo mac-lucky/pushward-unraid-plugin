@@ -3,7 +3,7 @@
 <!DOCTYPE PLUGIN [
 <!ENTITY name      "pushward-unraid">
 <!ENTITY author    "mac-lucky">
-<!ENTITY version   "2026.07.30d">
+<!ENTITY version   "2026.08.31">
 <!ENTITY gitURL    "https://github.com/mac-lucky/pushward-unraid-plugin">
 <!ENTITY pluginURL "&gitURL;/raw/main/pushward-unraid.plg">
 <!ENTITY supportURL "&gitURL;/issues">
@@ -18,8 +18,16 @@
         min="6.12">
 
 <CHANGES>
-###2026.07.30d
-- Internal tidy-up only: no behaviour changes
+###2026.08.31
+- Pick which PushWard level an Unraid Alert becomes: Normal, Time Sensitive (the new default) or Critical, which breaks through Do Not Disturb and the silent switch
+- Warnings stay Normal; everything below stays quiet
+- Repeats of the same alert replace the previous banner instead of stacking one per repeat; the app's list still keeps every one
+- Tap a notification about a job the plugin is tracking to open that Live Activity
+- Live Activity cards carry an Open button that goes to the matching page in the web UI; set "Unraid web UI URL" if you reach the server by another name
+- Label VM backup steps with the VM name: red for one that failed, orange for one the backup could not find
+- Clear the cards from the Lock Screen as soon as the array stops or the plugin is uninstalled, instead of leaving them to go stale
+- New optional Home Screen widgets: array fill, free space per disk and pool plus the UPS, and a status list with array state, parity result and mover
+- Widgets are off by default and need the widgets capability on your API key
 ###2026.07.30b
 - Honour a Live Activities "Disabled" setting saved from a Windows editor: a carriage return in the config file made the monitor read the value as enabled and start anyway
 - Never leave a stray marker behind if the box is shut down mid-install, which could make the plugin refuse to install or update until a reboot
@@ -106,6 +114,21 @@ ensure PUSHWARD_TRACK_VMBACKUP '"true"'
 ensure PUSHWARD_TRACK_UPS '"true"'
 ensure PUSHWARD_POLL_INTERVAL '"15"'
 ensure PUSHWARD_ACTIVITY_PRIORITY '"5"'
+# Which interruption level an Unraid "alert" importance maps to. Not critical by
+# default: that level bypasses Do Not Disturb and the ringer switch, and Unraid's
+# alert tier is not curated for 3am - "disk is low on space" and "disk in error
+# state" are both alerts.
+ensure PUSHWARD_ALERT_LEVEL '"time-sensitive"'
+# Blank means auto: NGINX_DEFAULTURL from nginx.ini, the same value Unraid's own
+# notify script builds its email links from.
+ensure PUSHWARD_WEBUI_URL '""'
+# Widgets default OFF. The routes need the `widgets` capability on the key and
+# the setup instructions have only ever asked for notifications + activity:manage,
+# so defaulting on would 403-loop every installed box on the next auto-update;
+# PATCH /widgets also spends the account's widget-update quota, and three
+# uninvited entries in someone's iOS widget picker is not ours to add.
+ensure PUSHWARD_WIDGETS_ENABLED '"false"'
+ensure PUSHWARD_WIDGET_INTERVAL '"300"'
 chmod 600 "$CFG_FILE"
 echo "PushWard config ready at $CFG_FILE"
 ]]>
@@ -123,7 +146,10 @@ echo "PushWard config ready at $CFG_FILE"
 # TIMESTAMP. Posts them to the PushWard notification API. No daemon, no Unraid
 # API key. Config: /boot/config/plugins/pushward-unraid/pushward-unraid.cfg
 
-CFG="/boot/config/plugins/pushward-unraid/pushward-unraid.cfg"
+# The override exists so CI can drive the agent without /boot; only root can set
+# it, and dynamix hands the agent a controlled environment.
+CFG="${PUSHWARD_CFG:-/boot/config/plugins/pushward-unraid/pushward-unraid.cfg}"
+STATE_FILE="${PUSHWARD_STATE:-/var/run/pushward/state.json}"
 [ -f "$CFG" ] || exit 0
 
 # Read the config by parsing, NOT by sourcing it: the values are operator-entered
@@ -142,6 +168,7 @@ pw_cfg() {  # $1 = key -> value with surrounding quotes stripped
 PUSHWARD_API_KEY="$(pw_cfg PUSHWARD_API_KEY)"
 PUSHWARD_URL="$(pw_cfg PUSHWARD_URL)"
 PUSHWARD_SERVER_NAME="$(pw_cfg PUSHWARD_SERVER_NAME)"
+PUSHWARD_ALERT_LEVEL="$(pw_cfg PUSHWARD_ALERT_LEVEL)"
 
 # Nothing to send without an API key; exit cleanly so the notification pipeline
 # isn't disrupted.
@@ -150,17 +177,91 @@ PUSHWARD_SERVER_NAME="$(pw_cfg PUSHWARD_SERVER_NAME)"
 URL="${PUSHWARD_URL:-https://api.pushward.app}"
 SERVER_NAME="${PUSHWARD_SERVER_NAME:-Unraid}"
 
-# Map Unraid importance (alert/warning/normal) to a PushWard interruption level.
+# Map Unraid importance to a PushWard interruption level. Unraid only has three
+# levels (normal/warning/alert), so which one an alert lands on is an operator
+# choice: PUSHWARD_ALERT_LEVEL picks between active, time-sensitive and critical.
+#
+# The subject rule below only ever raises. It is tempting to demote a
+# "Notice [...]" subject, but Unraid's own monitor sends parity-check finished
+# WITH errors as exactly that, at importance warning - demoting on the prefix
+# would silence a parity check that found problems.
+ALERT_LEVEL="${PUSHWARD_ALERT_LEVEL:-time-sensitive}"
+case "$ALERT_LEVEL" in
+  active | time-sensitive | critical) ;;
+  *) ALERT_LEVEL="time-sensitive" ;;
+esac
+
 case "$(printf '%s' "${IMPORTANCE:-}" | tr '[:upper:]' '[:lower:]')" in
-  alert | warning) LEVEL="active" ;;
+  alert) LEVEL="$ALERT_LEVEL" ;;
+  warning) LEVEL="active" ;;
   *) LEVEL="passive" ;;
 esac
+
+case "${SUBJECT:-}" in
+  "Alert ["*) [ "$LEVEL" = "passive" ] && LEVEL="$ALERT_LEVEL" ;;
+  "Warning ["*) [ "$LEVEL" = "passive" ] && LEVEL="active" ;;
+esac
+
+# Collapse repeats of the same event into one banner. Unraid's own archive
+# dedupe never fires (notify sets the ticket to the timestamp), which is why a
+# repeating SMART warning stacks today. The server name is in the key because
+# thread_id is the constant "unraid": without it two boxes on one account would
+# collapse each other's "Unraid Disk 1 error". The inbox still keeps every
+# notification - collapsing only affects the delivered banner.
+#
+# Keying on EVENT alone and not EVENT+SUBJECT is deliberate: the SMART subject
+# embeds the ticking raw attribute value, so a subject-derived key would change
+# on every repeat and stack again.
+COLLAPSE_ID=""
+if [ -n "${EVENT:-}" ]; then
+  slugify() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed -e 's/[^a-z0-9]\{1,\}/-/g' -e 's/^-//' -e 's/-$//'; }
+  COLLAPSE_ID="$(slugify "$SERVER_NAME-$EVENT")"
+  # 64 is the server cap. Keep a readable prefix and make the tail collision-safe
+  # rather than truncating two long events onto the same key.
+  if [ "${#COLLAPSE_ID}" -gt 64 ]; then
+    COLLAPSE_ID="$(printf '%s' "$COLLAPSE_ID" | cut -c1-31)-$(printf '%s\0%s' "$SERVER_NAME" "$EVENT" | sha1sum | cut -c1-32)"
+  fi
+fi
+
+# Deep-link the notification into the Live Activity the monitor daemon is
+# driving for the same job, when there is one. The slug prefix comes from the
+# daemon's own state rather than being re-derived here: a second copy of
+# slug_prefix() with nothing pinning the two together is how they drift.
+ACTIVITY_SLUG=""
+if [ -n "${EVENT:-}" ] && [ -r "$STATE_FILE" ]; then
+  # shellcheck disable=SC2016
+  ACTIVITY_SLUG="$(EVENT="$EVENT" STATE_FILE="$STATE_FILE" php -r '
+    $state = json_decode((string) @file_get_contents(getenv("STATE_FILE")), true);
+    $prefix = $state["_meta"]["prefix"] ?? "";
+    if (!is_string($prefix) || $prefix === "") { exit(0); }
+    $event = strtolower(trim((string) getenv("EVENT")));
+    $suffix = "";
+    if (str_starts_with($event, "unraid parity-check")
+        || str_starts_with($event, "unraid parity-sync")
+        || str_starts_with($event, "unraid data-rebuild")
+        || str_starts_with($event, "unraid read-check")
+        || str_starts_with($event, "unraid disk-clear")) {
+        $suffix = "-array";
+    } elseif (str_starts_with($event, "appdata backup")) {
+        $suffix = "-backup";
+    } elseif (str_starts_with($event, "unraid-vmbackup")) {
+        $suffix = "-vmbackup";
+    }
+    // Only claim the slug when the activity is LIVE. A state key is never
+    // removed - the idle branch writes active=false back, and vmbackup seeds its
+    // key on a box that has never run one - so a mere isset() attaches a dead
+    // slug to every parity/backup/vmbackup notification, 422s, and burns the
+    // retry below on the common case instead of the rare race it exists for.
+    $key = $prefix . $suffix;
+    if ($suffix !== "" && !empty($state[$key]["active"])) { echo $key; }
+  ' 2>/dev/null)"
+fi
 
 # Build the JSON with PHP (always present on Unraid) so titles/bodies with
 # quotes, newlines or unicode are escaped correctly. The $-vars below are PHP,
 # not shell, so single quotes are intentional.
 # shellcheck disable=SC2016
-payload="$(SERVER_NAME="$SERVER_NAME" LEVEL="$LEVEL" php -r '
+payload="$(SERVER_NAME="$SERVER_NAME" LEVEL="$LEVEL" COLLAPSE_ID="$COLLAPSE_ID" ACTIVITY_SLUG="$ACTIVITY_SLUG" php -r '
   $title = getenv("SUBJECT");
   if ($title === false || $title === "") $title = getenv("EVENT");
   if ($title === false || $title === "") $title = "Unraid notification";
@@ -186,7 +287,13 @@ payload="$(SERVER_NAME="$SERVER_NAME" LEVEL="$LEVEL" php -r '
     "thread_id"           => "unraid",
     "url"                 => getenv("LINK") ?: "",
     "metadata"            => (object) $meta,
-  ], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_INVALID_UTF8_SUBSTITUTE);
+  ] + array_filter([
+    // Both are omitted when empty rather than sent blank: an empty collapse_id
+    // would make every unlabelled notification replace every other one, and an
+    // empty activity_slug is simply not a link.
+    "collapse_id"   => getenv("COLLAPSE_ID") ?: "",
+    "activity_slug" => getenv("ACTIVITY_SLUG") ?: "",
+  ], fn($v) => $v !== ""), JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_INVALID_UTF8_SUBSTITUTE);
   if ($json === false) { fwrite(STDERR, json_last_error_msg()); exit(1); }
   echo $json;
 ')"
@@ -200,19 +307,43 @@ fi
 # Surface delivery failures to the system log instead of swallowing them, so a
 # dropped alert (bad key, missing capability, 4xx/5xx, network) is diagnosable.
 # Still exit 0 so the dynamix notification pipeline isn't disrupted.
-curl -fsS -m 15 -X POST "$URL/notifications" \
-  -H "Authorization: Bearer $PUSHWARD_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d "$payload" >/dev/null 2>&1
-rc=$?
-if [ "$rc" -ne 0 ]; then
-  logger -t pushward "notification delivery to PushWard failed (curl exit $rc; subject: ${SUBJECT:-?})"
+post() {  # $1 = payload -> prints the HTTP status, or 000 when curl itself failed
+  curl -sS -m 15 -o /dev/null -w '%{http_code}' -X POST "$URL/notifications" \
+    -H "Authorization: Bearer $PUSHWARD_API_KEY" \
+    -H "Content-Type: application/json" \
+    -d "$1" 2>/dev/null || printf '000'
+}
+
+code="$(post "$payload")"
+
+# A 422 with a slug attached means the activity was swept between the monitor's
+# last write and this notification. Retry once WITHOUT the slug rather than let
+# a raced link swallow a disk-failure alert - the server creates nothing on that
+# rejection. Only 422, and only when a slug was actually sent: a 429 or 5xx must
+# not be retried into a duplicate.
+if [ "$code" = "422" ] && [ -n "$ACTIVITY_SLUG" ]; then
+  logger -t pushward "notification rejected with a stale activity_slug ($ACTIVITY_SLUG); retrying without it"
+  # shellcheck disable=SC2016
+  retry="$(printf '%s' "$payload" | php -r '
+    $j = json_decode((string) stream_get_contents(STDIN), true);
+    if (!is_array($j)) { exit(1); }
+    unset($j["activity_slug"]);
+    echo json_encode($j, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_INVALID_UTF8_SUBSTITUTE);
+  ')"
+  if [ -n "$retry" ]; then
+    code="$(post "$retry")"
+  fi
 fi
+
+case "$code" in
+  2*) ;;
+  *) logger -t pushward "notification delivery to PushWard failed (HTTP $code; subject: ${SUBJECT:-?})" ;;
+esac
 
 exit 0
 ]]>
 </INLINE>
-<MD5>a21279596f705a8d57db50529f39a77c</MD5>
+<MD5>e40094691f7d366b216ed229e1a3c84c</MD5>
 </FILE>
 
 <!-- 3. Test-notification helper (Settings page button). -->
@@ -284,6 +415,9 @@ const LOG_MAX    = 262144; // 256 KiB before truncation
 const BACKUP_TMP = '/tmp/appdata.backup';
 const VAR_INI    = '/var/local/emhttp/var.ini';
 const DISKS_INI  = '/var/local/emhttp/disks.ini';
+// Also hardcoded in pushward-settings.page, which shows the resolved web UI
+// base next to the setting; keep the two in step.
+const NGINX_INI  = '/var/local/emhttp/nginx.ini';
 const SHARES_DIR = '/boot/config/shares';
 const SYSLOG     = '/var/log/syslog';
 const VMBACKUP_CFG = '/boot/config/plugins/vmbackup/user.cfg';
@@ -297,6 +431,7 @@ const MOVER_MIN_MOVABLE    = 1073741824; // 1 GiB: below this, skip the % and sh
 const MOVER_DU_BUDGET      = 25;  // seconds budget for the one-shot movable-size baseline du
 const PARITY_ETA_MAX_SECS  = 2592000; // 30 days: a longer ETA is a bad speed sample, not a forecast
 const VIRSH_TIMEOUT_SECS   = 5;   // cap a dumpxml against an unresponsive libvirtd
+const MAX_STEP_LABEL_RUNES = 32;  // server cap on a step_labels entry
 
 // ---------------------------------------------------------------------------
 // Config
@@ -320,6 +455,12 @@ function load_cfg(): array {
         'ups'      => $bool('PUSHWARD_TRACK_UPS', true),
         'interval' => max(5, (int) ($cfg['PUSHWARD_POLL_INTERVAL'] ?? 15)),
         'priority' => max(0, min(10, (int) ($cfg['PUSHWARD_ACTIVITY_PRIORITY'] ?? 5))),
+        'webui'    => trim($cfg['PUSHWARD_WEBUI_URL'] ?? ''),
+        // Widgets require the `widgets` capability on the key, which the setup
+        // instructions have never asked for, so this one defaults OFF: the
+        // literal string "true" turns it on, unlike every toggle above.
+        'widgets'  => ($cfg['PUSHWARD_WIDGETS_ENABLED'] ?? 'false') === 'true',
+        'widget_interval' => max(60, min(3600, (int) ($cfg['PUSHWARD_WIDGET_INTERVAL'] ?? 300))),
     ];
 }
 
@@ -400,14 +541,21 @@ function pw_ok(array $r): bool {
     return $r['code'] >= 200 && $r['code'] < 300;
 }
 
-function pw_create(array $cfg, string $slug, string $name, int $priority, int $endedTtl = 300, int $staleTtl = 1800): array {
-    return pw_request($cfg, 'POST', '/activities', [
+function pw_create(array $cfg, string $slug, string $name, int $priority, int $endedTtl = 300, int $staleTtl = 1800, ?int $dismissalTtl = null): array {
+    $body = [
         'slug'      => $slug,
         'name'      => $name,
         'priority'  => $priority,
         'ended_ttl' => $endedTtl,
         'stale_ttl' => $staleTtl,
-    ]);
+    ];
+    // Only send dismissal_ttl when asked for: 0 is a real setting (clear the
+    // Lock Screen at once) and null means "leave the server default", so the
+    // key has to be absent rather than zero.
+    if ($dismissalTtl !== null) {
+        $body['dismissal_ttl'] = $dismissalTtl;
+    }
+    return pw_request($cfg, 'POST', '/activities', $body);
 }
 
 function pw_patch(array $cfg, string $slug, array $patch): array {
@@ -522,22 +670,81 @@ function detect_parity(array $md): ?array {
 }
 
 // ---------------------------------------------------------------------------
+// disks.ini
+//
+// The one file that already carries every disk's size, SMART status and error
+// count, kept warm by Unraid itself. Both the mover baseline and all three
+// widgets read it through here; nothing may reach for smartctl/hdparm instead
+// and spin a sleeping disk up to learn what this file already says.
+// ---------------------------------------------------------------------------
+
+/**
+ * Per-section disk facts from disks.ini: filesystem sizes (KiB), SMART status
+ * and error count.
+ *
+ * Hand-rolled rather than parse_ini_file(DISKS_INI, true, INI_SCANNER_RAW),
+ * which returns the section keys with their quotes still attached ('"disk1"',
+ * not 'disk1') and would silently stop every name predicate below matching.
+ */
+function disks_ini_sections(): array {
+    $data = (string) @file_get_contents(DISKS_INI);
+    if ($data === '') {
+        return [];
+    }
+    $out     = [];
+    $section = '';
+    foreach (preg_split('/\r?\n/', $data) as $line) {
+        $line = trim($line);
+        if (preg_match('/^\["?([^"\]]+)"?\]$/', $line, $m)) {
+            $section = $m[1];
+            $out[$section] = [];
+        } elseif ($section !== '' && preg_match('/^([A-Za-z0-9_]+)="?([^"]*)"?$/', $line, $m)) {
+            $out[$section][$m[1]] = $m[2];
+        }
+    }
+    return $out;
+}
+
+/** True when a section is an array data disk (diskN), not parity, flash or a pool. */
+function is_array_disk(string $name): bool {
+    return (bool) preg_match('/^disk\d+$/', $name);
+}
+
+/** True when a section is a user-named pool: not diskN, parity or flash. */
+function is_pool_disk(string $name): bool {
+    return !preg_match('/^(disk\d+|parity\d*|flash)$/', $name);
+}
+
+// ---------------------------------------------------------------------------
 // Detection: mover (var.ini)
 // ---------------------------------------------------------------------------
 
-function var_ini_val(string $key): ?string {
+/**
+ * Whole of var.ini as a KEY => value map, in one read.
+ *
+ * Hand-rolled rather than parse_ini_file() for the same reason disks.ini is:
+ * the values are Unraid's own free text (a share comment, a model string) and
+ * an unbalanced quote in one of them would fail the whole parse and take every
+ * other key with it. This scan cannot fail, only miss a line.
+ */
+function var_ini_all(): array {
     $data = @file_get_contents(VAR_INI);
     if ($data === false) {
-        return null;
+        return [];
     }
-    if (preg_match('/^' . preg_quote($key, '/') . '="?([^"\n]*)"?/m', $data, $m)) {
-        return $m[1];
+    $out = [];
+    if (preg_match_all('/^([A-Za-z0-9_]+)="?([^"\n]*)"?/m', $data, $m, PREG_SET_ORDER)) {
+        foreach ($m as $kv) {
+            $out[$kv[1]] = $kv[2];
+        }
     }
-    return null;
+    return $out;
 }
 
-function detect_mover(): bool {
-    return var_ini_val('shareMoverActive') === 'yes';
+/** $var lets a caller that already read var.ini this poll skip a second read. */
+function detect_mover(?array $var = null): bool {
+    $v = $var ?? var_ini_all();
+    return ($v['shareMoverActive'] ?? null) === 'yes';
 }
 
 /**
@@ -546,20 +753,17 @@ function detect_mover(): bool {
  * names for the array, so anything else is a user-named cache pool.
  */
 function cache_pool_mounts(): array {
-    $data = (string) @file_get_contents(DISKS_INI);
     $mounts = [];
-    if (preg_match_all('/^\["?([^"\]]+)"?\]/m', $data, $m)) {
-        foreach ($m[1] as $name) {
-            if (preg_match('/^(disk\d+|parity\d*|flash)$/', $name)) {
-                continue;
-            }
-            $mp = '/mnt/' . $name;
-            if (is_dir($mp)) {
-                $mounts[$mp] = true;
-            }
+    foreach (array_keys(disks_ini_sections()) as $name) {
+        if (!is_pool_disk($name)) {
+            continue;
+        }
+        $mp = '/mnt/' . $name;
+        if (is_dir($mp)) {
+            $mounts[] = $mp;
         }
     }
-    return array_keys($mounts);
+    return $mounts;
 }
 
 /** Sum of used bytes (total - free) across the given mount points (statvfs). */
@@ -845,6 +1049,8 @@ function parse_vmbackup_line(string $line): ?array {
 function vmbackup_progress(string $logPath): array {
     $lines   = preg_split('/\r?\n/', (string) @file_get_contents($logPath)) ?: [];
     $done    = [];
+    $skipped = [];
+    $failed  = [];
     $current = '';
     $error   = false;
     foreach ($lines as $l) {
@@ -862,10 +1068,23 @@ function vmbackup_progress(string $logPath): array {
         if (preg_match('/^backup of (.+?) to .* completed\.?$/i', $msg, $m)) {
             $done[trim($m[1])] = true;
         }
+        // vmbackup logs this and moves on without ever making the VM current.
+        if (preg_match('/^(.+?) can not be found on the system/i', $msg, $m)) {
+            $skipped[trim($m[1])] = true;
+        }
         if ($p['level'] === 'error') {
             $error = true;
+            // Attribute the error to whichever VM is running when it lands. A
+            // run-level error before any VM starts has no owner and colours
+            // nothing, which is right: the card already turns orange.
+            if ($current !== '') {
+                $failed[$current] = true;
+            }
         }
     }
+    // The one config read of the tick: the labels, the weights, the colours and
+    // the step number all come off this list, so they cannot describe different
+    // plans within a tick the way three separate reads could.
     $vms   = vmbackup_planned_vms();
     $total = count($vms);
     $d     = count($done);
@@ -877,12 +1096,17 @@ function vmbackup_progress(string $logPath): array {
     $pos  = $current !== '' ? array_search($current, $vms, true) : false;
     $step = $pos !== false ? $pos + 1 : (($current !== '' || $d > 0) ? $d + 1 : 0);
     return [
+        'vms'      => $vms,
         'total'    => $total,
         'done'     => $d,
         'step'     => $total > 0 ? min($step, $total) : $step,
         'current'  => $current,
         'progress' => $total > 0 ? min(1.0, $d / $total) : null,
         'error'    => $error,
+        // A VM that completed cannot also have failed: an error logged while it
+        // was current may well have been about the next one.
+        'failed'   => array_diff_key($failed, $done),
+        'skipped'  => $skipped,
     ];
 }
 
@@ -937,8 +1161,7 @@ function vm_vdisk_bytes(string $vm): float {
  * disks spun up. Returns [] when nothing could be sized, which leaves the row
  * at equal widths rather than inventing a shape.
  */
-function vmbackup_step_weights(): array {
-    $vms = vmbackup_planned_vms();
+function vmbackup_step_weights(array $vms): array {
     if (!$vms) {
         return [];
     }
@@ -956,6 +1179,40 @@ function vmbackup_step_weights(): array {
     // fallback's purpose.
     $mean = array_sum($sized) / count($sized);
     return array_map(fn($w) => $w > 0 ? $w : $mean, $weights);
+}
+
+/**
+ * One label per planned VM, in vmbackup_planned_vms() order, so the segmented
+ * bar names each VM instead of showing anonymous blocks. Built from the same
+ * list as the weights and the step number, which is what keeps the three from
+ * drifting. Truncated to the server's 32-rune step_labels cap.
+ */
+function vmbackup_step_labels(array $vms): array {
+    return array_map(fn($vm) => mb_substr($vm, 0, MAX_STEP_LABEL_RUNES, 'UTF-8'), $vms);
+}
+
+/**
+ * Per-step colors: red for a VM whose backup failed, orange for one vmbackup
+ * could not find, and empty (falls back to accent_color) for the rest. Returns
+ * [] when nothing is coloured - an all-empty array is valid but costs a
+ * structural push for no visible change.
+ */
+function vmbackup_step_colors(array $vms, array $failed, array $skipped): array {
+    $colors = [];
+    $any    = false;
+    foreach ($vms as $vm) {
+        $c = '';
+        if (isset($failed[$vm])) {
+            $c = 'red';
+        } elseif (isset($skipped[$vm])) {
+            $c = 'orange';
+        }
+        if ($c !== '') {
+            $any = true;
+        }
+        $colors[] = $c;
+    }
+    return $any ? $colors : [];
 }
 
 // ---------------------------------------------------------------------------
@@ -1030,10 +1287,88 @@ function should_push(array $st, float $progress, string $stateText, bool $newCon
  * @param array|null $content  desired content frame while active, or null when idle
  * @param array      $st       per-slug persisted state (by ref)
  */
+/**
+ * Base URL of this server's web UI: PUSHWARD_WEBUI_URL when set, otherwise
+ * NGINX_DEFAULTURL from nginx.ini - the same value Unraid's own notify script
+ * builds its links from, so the button on a card and the link in an alert email
+ * agree. '' when neither is available, which drops the button.
+ *
+ * Auto-detection deliberately does not try to be clever about WAN or Tailscale
+ * names: matching what Unraid itself sends is the predictable choice, and
+ * PUSHWARD_WEBUI_URL covers off-LAN access (NGINX_TAILSCALEFQDN is the usual
+ * value there).
+ */
+function unraid_webui_base(array $cfg): string {
+    $base = trim((string) ($cfg['webui'] ?? ''));
+    if ($base === '') {
+        $ini  = @parse_ini_file(NGINX_INI) ?: [];
+        $base = trim((string) ($ini['NGINX_DEFAULTURL'] ?? ''));
+    }
+    // PUSHWARD_WEBUI_URL is unvalidated operator free text, and a schemeless
+    // "tower.local" builds "tower.local/Main", which the phone cannot open. No
+    // button beats a dead button. The no-whitespace tail matters as much as the
+    // scheme: Go's url.Parse rejects a space in the host, so "https://my tower"
+    // would 422 every PATCH the button rides on rather than just failing to open.
+    if (!preg_match('#^https?://[^\s]+$#i', $base)) {
+        return '';
+    }
+    return rtrim($base, '/');
+}
+
+/** Which web UI page each activity's "Open" button goes to, keyed by slug suffix. */
+const WEBUI_PATHS = [
+    '-array'    => '/Main',
+    '-mover'    => '/Main',
+    '-backup'   => '/Settings/AB.Main',
+    '-vmbackup' => '/Settings/Vmbackup',
+    '-ups'      => '/Settings/UPSsettings',
+    '-test'     => '/Settings/pushward-activities',
+];
+
+/**
+ * The "Open" button for a web UI path, or null when the base URL is
+ * unresolvable. The widgets, which have no activity slug, use this directly.
+ *
+ * url_action, not tap_action: tap_action would override the whole-card tap,
+ * which opens the PushWard app on the activity detail - what a user expects
+ * from the card body. This adds a labelled button beside it.
+ */
+function unraid_webui_link(array $cfg, string $path): ?array {
+    $base = unraid_webui_base($cfg);
+    return $base === ''
+        ? null
+        : ['url' => $base . $path, 'foreground' => true, 'title' => 'Open', 'icon' => 'safari'];
+}
+
+/**
+ * The "Open" button for one activity slug.
+ *
+ * An exact lookup on the suffix left after the server's slug prefix, never a
+ * str_ends_with() scan over the table: that scan let a bare suffix be passed in
+ * place of a slug, and it made "-backup" miss "-vmbackup" only by the accident
+ * of one character.
+ */
+function unraid_url_action(array $cfg, string $slug): ?array {
+    $prefix = slug_prefix($cfg['server']);
+    if (!str_starts_with($slug, $prefix)) {
+        return null;
+    }
+    $path = WEBUI_PATHS[substr($slug, strlen($prefix))] ?? null;
+    return $path !== null ? unraid_webui_link($cfg, $path) : null;
+}
+
 function drive_activity(array $cfg, string $slug, string $name, ?array $content, float $progress, string $stateText, bool $newContent, array &$st): void {
     $now = time();
 
     if ($content !== null) {
+        // content is an RFC 7396 merge patch, so a transient nginx.ini read
+        // failure costs nothing: omitting the key keeps the button the server
+        // already holds. No stash, and an edited PUSHWARD_WEBUI_URL therefore
+        // takes effect on the next tick rather than the next run.
+        $urlAction = unraid_url_action($cfg, $slug);
+        if ($urlAction !== null) {
+            $content['url_action'] = $urlAction;
+        }
         if (empty($st['active'])) {
             if (!empty($st['start_fail_ts']) && ($now - (int) $st['start_fail_ts']) < START_RETRY_SECS) {
                 return; // back off after a failed create
@@ -1399,11 +1734,17 @@ function tick_vmbackup(array $cfg, string $prefix, array &$state): void {
             // vmbackup settings page returns [], and isset would cache that
             // failure for the whole run with no retry.
             if (empty($st['step_weights'])) {
-                $st['step_weights'] = vmbackup_step_weights(); // one-shot per run
+                $st['step_weights'] = vmbackup_step_weights($bp['vms']); // one-shot per run
+                $st['step_labels']  = vmbackup_step_labels($bp['vms']);
             }
             // Only attach when the count matches (a mid-run config edit could
             // desync it); a length mismatch is a 422 on the steps template.
             $weights = count($st['step_weights']) === $total ? $st['step_weights'] : null;
+            $labels  = count($st['step_labels'] ?? []) === $total ? $st['step_labels'] : null;
+            // Colours are recomputed every tick, not cached: a VM fails partway
+            // through a run and the bar has to show it from that tick onward.
+            $cols   = vmbackup_step_colors($bp['vms'], $bp['failed'], $bp['skipped']);
+            $colors = count($cols) === $total ? $cols : null;
             $content = [
                 'template'     => 'steps',
                 'progress'     => round((float) $bp['progress'], 4),
@@ -1428,6 +1769,10 @@ function tick_vmbackup(array $cfg, string $prefix, array &$state): void {
             // remaining update of the run - the exact desync this guards.
             $content['step_weights']           = $weights;
             $st['end_content']['step_weights'] = $weights;
+            $content['step_labels']            = $labels;
+            $st['end_content']['step_labels']  = $labels;
+            $content['step_colors']            = $colors;
+            $st['end_content']['step_colors']  = $colors;
         } else {
             // Plan is "all"/unknown: steps needs a fixed total, so fall back to a
             // generic indeterminate frame rather than a bouncing fraction.
@@ -1449,7 +1794,7 @@ function tick_vmbackup(array $cfg, string $prefix, array &$state): void {
     } else {
         drive_activity($cfg, $slug, '', null, 1.0, '', false, $st);
         if (empty($st['active'])) {
-            unset($st['log_path'], $st['step_weights']);
+            unset($st['log_path'], $st['step_weights'], $st['step_labels']);
         }
     }
     $state[$slug] = $st;
@@ -1535,32 +1880,506 @@ function tick_ups(array $cfg, string $prefix, array &$state): void {
 function tick(array $cfg): void {
     $prefix = slug_prefix($cfg['server']);
     $state  = load_state();
-    // Every handler runs each tick and gates on its own toggle internally, so
-    // turning a source off while its activity is live still reaches the handler's
-    // idle branch and ends the activity (rather than freezing it until TTL).
-    $md = $cfg['parity'] ? md_status() : [];
-    tick_parity($cfg, $prefix, $md, $state);
-    tick_backup($cfg, $prefix, $state);
-    tick_mover($cfg, $prefix, $state);
-    tick_vmbackup($cfg, $prefix, $state);
-    tick_ups($cfg, $prefix, $state);
+    // The notification agent reads this to attach activity_slug without owning a
+    // second copy of slug_prefix(). Keys starting with an underscore are
+    // metadata, never activities - end_active() skips them.
+    $state['_meta'] = ['prefix' => $prefix];
+    if ($cfg['enabled']) {
+        // Every handler runs and gates on its own per-source toggle internally,
+        // so turning one source off while its activity is live still reaches
+        // that handler's idle branch and ends the card rather than freezing it
+        // until stale_ttl.
+        $md = $cfg['parity'] ? md_status() : [];
+        tick_parity($cfg, $prefix, $md, $state);
+        tick_backup($cfg, $prefix, $state);
+        tick_mover($cfg, $prefix, $state);
+        tick_vmbackup($cfg, $prefix, $state);
+        tick_ups($cfg, $prefix, $state);
+    } else {
+        // Activities off but widgets on keeps the daemon alive with no handler
+        // running, so nothing would ever reach those idle branches: an in-flight
+        // card would sit at its last frame until stale_ttl. End it here instead.
+        end_active($cfg, $state);
+    }
+    tick_widgets($cfg, $prefix, $state);
     save_state($state);
+}
+
+// ---------------------------------------------------------------------------
+// Home Screen widgets
+//
+// A second publishing surface alongside the Live Activities: three widgets that
+// stay on the phone's Home Screen instead of appearing for the duration of a
+// job. Off by default (see load_cfg) because the widget routes need the
+// `widgets` capability on the key, which the setup instructions never asked for.
+//
+// Everything below reads only files Unraid already keeps warm - disks.ini and
+// var.ini - plus the UPS reading the activity path already takes. A widget poll
+// must NEVER shell out to smartctl, hdparm or virsh: disks.ini already carries
+// status, temp and error counts, and a five-minute poll that spins the array up
+// to re-read them is real heat and wear for no new information.
+// ---------------------------------------------------------------------------
+
+const WIDGET_STALE_AFTER   = 3600; // floor for the dim-as-stale window; see widget_stale_after()
+const WIDGET_MAX_DEVICES   = 8;    // server cap on battery-template rings
+const WIDGET_MAX_STAT_ROWS = 6;    // server cap on stat_list rows; a seventh 422s every poll
+const MAX_DEVICE_NAME_RUNES = 32;  // server cap on a battery device name
+const WIDGET_SYNC_EPOCH_MIN = 946684800; // 2000-01-01: the server rejects a date before this
+
+function pw_widget_create(array $cfg, array $spec): array {
+    return pw_request($cfg, 'POST', '/widgets', $spec);
+}
+
+function pw_widget_patch(array $cfg, string $slug, array $patch): array {
+    return pw_request($cfg, 'PATCH', '/widgets/' . rawurlencode($slug), $patch, 'application/merge-patch+json');
+}
+
+function pw_widget_delete(array $cfg, string $slug): array {
+    return pw_request($cfg, 'DELETE', '/widgets/' . rawurlencode($slug), null);
+}
+
+/** Every widget slug this plugin owns for a given prefix. The one source of truth. */
+function widget_owned_slugs(string $prefix): array {
+    return [$prefix . '-array-fill', $prefix . '-storage', $prefix . '-status'];
+}
+
+/** A disk is unhealthy when SMART is not OK or Unraid has counted errors on it. */
+function disk_unhealthy(array $d): bool {
+    $status = strtoupper((string) ($d['status'] ?? ''));
+    return ($status !== '' && $status !== 'DISK_OK') || ((int) ($d['numErrors'] ?? 0)) > 0;
+}
+
+/** Array fill from the mounted data disks: [used, size] in bytes, or null. */
+function array_fill_bytes(array $sections): ?array {
+    $size = 0.0;
+    $used = 0.0;
+    foreach ($sections as $name => $d) {
+        if (!is_array_disk($name) || ($d['fsStatus'] ?? '') !== 'Mounted') {
+            continue;
+        }
+        // disks.ini reports filesystem figures in KiB.
+        $size += ((float) ($d['fsSize'] ?? 0)) * 1024;
+        $used += ((float) ($d['fsUsed'] ?? 0)) * 1024;
+    }
+    return $size > 0 ? [$used, $size] : null;
+}
+
+/** Content for the array-fill gauge, or null when the array is not mounted. */
+function widget_content_array_fill(array $sections, ?array $link): ?array {
+    $fill = array_fill_bytes($sections);
+    if ($fill === null) {
+        return null;
+    }
+    [$used, $size] = $fill;
+    $pct   = round($used / $size * 100, 1);
+    $color = $pct >= 95 ? 'red' : ($pct >= 90 ? 'orange' : 'blue');
+    return array_filter([
+        'template'     => 'gauge',
+        'value'        => $pct,
+        'min_value'    => 0,
+        'max_value'    => 100,
+        'unit'         => '%',
+        'label'        => 'Array',
+        'subtitle'     => human_bytes($used) . ' of ' . human_bytes($size),
+        'icon'         => 'externaldrive.fill',
+        'accent_color' => $color,
+        'url_action'   => $link,
+    ], fn($v) => $v !== null);
+}
+
+/**
+ * Content for the storage battery widget: one ring per mounted disk and pool,
+ * plus the UPS when apcupsd is running.
+ *
+ * The level is FREE space, not used: the Batteries idiom reads low as alarming,
+ * and low headroom is the alarming state for a disk. An unhealthy disk goes red
+ * whatever its level.
+ */
+function widget_content_storage(array $sections, ?array $link): ?array {
+    $devices = [];
+    foreach ($sections as $name => $d) {
+        if (($d['fsStatus'] ?? '') !== 'Mounted') {
+            continue;
+        }
+        $size = (float) ($d['fsSize'] ?? 0);
+        $free = (float) ($d['fsFree'] ?? 0);
+        if ($size <= 0) {
+            continue;
+        }
+        $isArray = is_array_disk($name);
+        if (!$isArray && !is_pool_disk($name)) {
+            continue; // parity carries no filesystem; flash is not worth a ring
+        }
+        // The server caps a device name at 32 runes and rejects a longer one,
+        // which would wedge the whole widget for a pool with a long name.
+        $label   = $isArray ? 'Disk ' . substr($name, 4) : ucfirst($name);
+        $healthy = !disk_unhealthy($d);
+        $devices[] = [
+            'name'    => mb_substr($label, 0, MAX_DEVICE_NAME_RUNES, 'UTF-8'),
+            'level'   => (int) round($free / $size * 100),
+            'icon'    => $isArray ? 'internaldrive' : 'externaldrive',
+            'color'   => $healthy ? null : 'red',
+            'healthy' => $healthy,
+        ];
+    }
+
+    $ups = ups_state();
+    if ($ups !== null && $ups['charge'] !== null) {
+        $devices[] = [
+            'name'     => 'UPS',
+            'level'    => (int) round($ups['charge']),
+            'icon'     => 'bolt.batteryblock.fill',
+            'color'    => $ups['on_battery'] ? 'orange' : null,
+            'charging' => !$ups['on_battery'],
+            'healthy'  => !$ups['on_battery'],
+        ];
+    }
+    if (!$devices) {
+        return null;
+    }
+
+    // The 8-device cap is a validation error, not a truncation, so trim here:
+    // unhealthy first (false <=> true is -1), then whichever has least headroom.
+    usort($devices, fn($a, $b) => [$a['healthy'], $a['level']] <=> [$b['healthy'], $b['level']]);
+    $devices = array_slice($devices, 0, WIDGET_MAX_DEVICES);
+    // 'healthy' is ours, not the API's - the device schema rejects unknown keys -
+    // so it comes off, along with any colour that resolved to nothing.
+    $devices = array_map(
+        fn($dev) => array_filter(array_diff_key($dev, ['healthy' => null]), fn($v) => $v !== null),
+        $devices
+    );
+
+    return array_filter([
+        'template'   => 'battery',
+        'label'      => 'Free space',
+        'icon'       => 'internaldrive',
+        // No device_sort: it is a WRITE-path sort, so asking the server to
+        // re-order by level would undo the trim priority above and bury an
+        // unhealthy-but-roomy disk past the 2 rings a small widget renders.
+        // Absent, the server keeps the order sent, which is the order chosen here.
+        'devices'    => $devices,
+        'url_action' => $link,
+    ], fn($v) => $v !== null);
+}
+
+/** Content for the six-row status stat_list, or null when var.ini is unreadable. */
+function widget_content_status(array $cfg, array $sections, array $var, ?array $link): ?array {
+    $mdState = $var['mdState'] ?? null;
+    if ($mdState === null) {
+        return null;
+    }
+    // mdColor is Unraid's own array health light: "green-on" when everything is
+    // fine, "green-blink" mid-rebuild, an amber/red value when it is not.
+    // mdNumInvalid is NOT a health signal - an unassigned parity2 slot counts as
+    // invalid, so on a single-parity box it reads 1 forever and would paint a
+    // perfectly healthy array red for the life of the install.
+    $mdColor  = (string) ($var['mdColor'] ?? '');
+    $degraded = $mdColor !== '' && !str_starts_with($mdColor, 'green');
+    $syncErrs = (int) ($var['sbSyncErrs'] ?? 0);
+    // sbSynced is when the check STARTED; sbSynced2 is when it finished. The row
+    // is a "last parity check" timer, so prefer the completion stamp and fall
+    // back to the start only for an array that has never finished one.
+    $synced   = (int) ($var['sbSynced2'] ?? 0) ?: (int) ($var['sbSynced'] ?? 0);
+
+    $arrayState = $mdState === 'STARTED' ? ($degraded ? 'Degraded' : 'Started') : 'Stopped';
+    $fill       = array_fill_bytes($sections);
+
+    $bad = 0;
+    $all = 0;
+    foreach ($sections as $name => $d) {
+        // Parity counts: a failing parity disk is the most alarming state an
+        // Unraid box has, and leaving it out reported "N OK" through it. The
+        // boot flash and never-assigned slots still do not. Exact match, not a
+        // prefix: DISK_NP_DSBL and DISK_NP_MISSING are a disabled and a missing
+        // disk, which are exactly the faults this count exists to surface.
+        if ($name === 'flash' || ($d['status'] ?? '') === 'DISK_NP') {
+            continue;
+        }
+        $all++;
+        if (disk_unhealthy($d)) {
+            $bad++;
+        }
+    }
+
+    $rows = [
+        ['label' => 'Array', 'value' => $arrayState],
+        ['label' => 'Used', 'value' => $fill ? human_bytes($fill[0]) : '-'],
+        ['label' => 'Free', 'value' => $fill ? human_bytes($fill[1] - $fill[0]) : '-'],
+    ];
+
+    $parity = ['label' => 'Parity', 'value' => $syncErrs > 0 ? $syncErrs . ' errors' : 'OK'];
+    // A relative timer re-renders on the device with no pushes at all, so the
+    // "3 days ago" reading stays honest between polls. Guarded on the epoch
+    // floor: the server rejects a date before 2000, and sbSynced is 0 on a
+    // never-synced array.
+    if ($synced > WIDGET_SYNC_EPOCH_MIN) {
+        $parity['timer'] = ['date' => gmdate('c', $synced), 'style' => 'relative'];
+    }
+    $rows[] = $parity;
+
+    $rows[] = ['label' => 'Mover', 'value' => detect_mover($var) ? 'Running' : 'Idle'];
+    $rows[] = ['label' => 'Disks', 'value' => $bad > 0 ? $bad . ' need attention' : $all . ' OK'];
+
+    $usedPct  = $fill ? $fill[0] / $fill[1] * 100 : 0;
+    $severity = ($bad > 0 || $degraded) ? 'critical' : (($syncErrs > 0 || $usedPct >= 95) ? 'warning' : 'info');
+    $accent   = ['critical' => 'red', 'warning' => 'orange', 'info' => 'blue'][$severity];
+
+    return array_filter([
+        'template'     => 'stat_list',
+        'label'        => $cfg['server'],
+        'icon'         => 'server.rack',
+        'severity'     => $severity,
+        'accent_color' => $accent,
+        // The row list above sits exactly on the cap, so a seventh row added
+        // here would 422 the widget on every poll rather than just not render.
+        'stat_rows'    => array_slice($rows, 0, WIDGET_MAX_STAT_ROWS),
+        'url_action'   => $link,
+    ], fn($v) => $v !== null);
+}
+
+/**
+ * The three widget specs for this run. Each carries its rendered content, or
+ * null when the data for it is unavailable this poll.
+ */
+function widget_specs(array $cfg, string $prefix): array {
+    $sections = disks_ini_sections();
+    $var      = var_ini_all();
+    // All three buttons open the same page, so the base URL is resolved once
+    // here instead of once per widget.
+    $link     = unraid_webui_link($cfg, WEBUI_PATHS['-array']);
+    return [
+        ['slug' => $prefix . '-array-fill', 'name' => $cfg['server'] . ' array', 'content' => widget_content_array_fill($sections, $link)],
+        ['slug' => $prefix . '-storage', 'name' => $cfg['server'] . ' storage', 'content' => widget_content_storage($sections, $link)],
+        ['slug' => $prefix . '-status', 'name' => $cfg['server'] . ' status', 'content' => widget_content_status($cfg, $sections, $var, $link)],
+    ];
+}
+
+/**
+ * How long the phone waits before dimming a widget as stale. WIDGET_STALE_AFTER
+ * is a floor, not the answer: PUSHWARD_WIDGET_INTERVAL goes up to 3600, where
+ * the poll period would equal the window exactly and any jitter dims a card
+ * that is perfectly current.
+ */
+function widget_stale_after(array $cfg): int {
+    return max(WIDGET_STALE_AFTER, $cfg['widget_interval'] * 3);
+}
+
+/** Heartbeat: re-send the stored payload this often even when nothing changed. */
+function widget_heartbeat_secs(array $cfg): int {
+    return intdiv(widget_stale_after($cfg), 2);
+}
+
+/**
+ * Create-once, PATCH-on-change, heartbeat-otherwise - the same shape the
+ * pushward-integrations widget manager uses.
+ */
+function widget_drive(array $cfg, array $spec, array &$st): void {
+    $now  = time();
+    $slug = $spec['slug'];
+
+    // No data this poll (array stopped, apcupsd restarting). Skip: publishing a
+    // stale value would be a lie and deleting the widget would take it off the
+    // user's Home Screen for a transient. Letting stale_after dim it is the
+    // truthful outcome, and the status widget separately says "Stopped".
+    if ($spec['content'] === null) {
+        return;
+    }
+
+    $tuning = ['push_throttle' => max(60, $cfg['widget_interval']), 'stale_after' => widget_stale_after($cfg)];
+
+    // POST is an idempotent upsert that also refreshes the tuning, costs no
+    // quota and fires no push, so it doubles as the "the operator changed the
+    // interval" path.
+    if (empty($st['created']) || ($st['tuning'] ?? null) != $tuning) {
+        // A floor, not an active brake: the cadence gate already keeps polls at
+        // least widget_interval (>= 60s) apart, so this only bites the
+        // back-to-back `widgets-once` path and any future shorter interval.
+        if (!empty($st['fail_ts']) && ($now - (int) $st['fail_ts']) < START_RETRY_SECS) {
+            return;
+        }
+        $r = pw_widget_create($cfg, ['slug' => $slug, 'name' => $spec['name'], 'content' => $spec['content']] + $tuning);
+        if (!pw_ok($r)) {
+            $st['fail_ts'] = $now;
+            mlog("widget create $slug failed: {$r['code']} {$r['body']}", 'error');
+            return;
+        }
+        unset($st['fail_ts']);
+        $st['created'] = true;
+        $st['tuning']  = $tuning;
+        $st['content'] = $spec['content'];
+        $st['sent_ts'] = $now;
+        mlog("widget created $slug");
+        return;
+    }
+
+    // Loose ==, deliberately: the stored copy has round-tripped through JSON, so
+    // 100 vs 100.0 must not read as a change and cost a push.
+    $changed = ($st['content'] ?? null) != $spec['content'];
+    if (!$changed && ($now - (int) ($st['sent_ts'] ?? 0)) < widget_heartbeat_secs($cfg)) {
+        return;
+    }
+
+    // The heartbeat re-sends the STORED payload verbatim, never a re-render. The
+    // server treats byte-identical merged content as a touch: it re-stamps
+    // updated_at with no push and refunds the quota slot. Re-rendering would
+    // break that equality and turn every heartbeat into a real push.
+    $payload = $changed ? $spec['content'] : $st['content'];
+    $r = pw_widget_patch($cfg, $slug, ['content' => $payload]);
+    if ($r['code'] === 404) {
+        // Deleted in the app. Re-create on the next poll rather than 404-looping.
+        $st['created'] = false;
+        return;
+    }
+    if (!pw_ok($r)) {
+        mlog("widget update $slug failed: {$r['code']} {$r['body']}", 'error');
+        return;
+    }
+    $st['content'] = $payload;
+    $st['sent_ts'] = $now;
+}
+
+/**
+ * Remove every widget this plugin owns and forget the local state.
+ *
+ * The owned set is seeded unconditionally from the CURRENT server name's prefix,
+ * not only from the recorded slugs, and that is what covers a reboot: /var/run
+ * is tmpfs, so the state file is gone and there is nothing recorded left to
+ * delete. Only ever the exact owned-slug set, never a bare prefix - the same key
+ * may drive the relay, a second box or a hand-made widget.
+ *
+ * On a failed delete the state is KEPT, with a retry stamp, so an API outage at
+ * toggle-off does not orphan the widgets on the account forever.
+ */
+function widgets_teardown(array $cfg, array &$state): void {
+    $prefixes = array_unique(array_filter([
+        slug_prefix($cfg['server']),
+        (string) ($state['_widgets']['prefix'] ?? ''),
+    ]));
+    $owned = [];
+    foreach ($prefixes as $p) {
+        foreach (widget_owned_slugs($p) as $slug) {
+            $owned[$slug] = true;
+        }
+    }
+
+    foreach (array_keys($state['_widgets']['slugs'] ?? []) as $slug) {
+        $owned[$slug] = true;
+    }
+
+    $failed = false;
+    foreach (array_keys($owned) as $slug) {
+        $r = pw_widget_delete($cfg, $slug);
+        if (pw_ok($r) || $r['code'] === 404) {
+            mlog("widget removed $slug");
+        } else {
+            $failed = true;
+            mlog("widget delete $slug failed: {$r['code']}", 'warn');
+        }
+    }
+    if ($failed) {
+        // Keep the owned set so the next poll retries it, behind a backoff of
+        // its own - teardown_ts, not the poll cadence's next_ts, so an operator
+        // toggling widgets off still gets an immediate first attempt.
+        $state['_widgets'] = [
+            'prefix'      => (string) ($state['_widgets']['prefix'] ?? slug_prefix($cfg['server'])),
+            'teardown_ts' => time() + max(START_RETRY_SECS, $cfg['widget_interval']),
+            'slugs'       => array_fill_keys(array_keys($owned), []),
+        ];
+        return;
+    }
+    unset($state['_widgets']);
+}
+
+/**
+ * One widget poll. Gates on the toggle internally, the same way the activity
+ * handlers do, so turning widgets off mid-run reaches the teardown branch
+ * instead of freezing the widgets in place.
+ */
+function tick_widgets(array $cfg, string $prefix, array &$state): void {
+    $w       = $state['_widgets'] ?? null;
+    $now     = time();
+    $retryTs = (int) ($w['teardown_ts'] ?? 0);
+
+    if (!$cfg['widgets']) {
+        if ($w !== null && $now >= $retryTs) {
+            widgets_teardown($cfg, $state);
+        }
+        return;
+    }
+    // A renamed server changes every slug, so the old set has to go first.
+    if ($w !== null && ($w['prefix'] ?? '') !== $prefix) {
+        if ($now < $retryTs) {
+            return; // a previous teardown failed; wait the backoff out
+        }
+        widgets_teardown($cfg, $state);
+        if (isset($state['_widgets'])) {
+            return; // deletes failed - retry before publishing under the new name
+        }
+        $w = null;
+    }
+
+    $w = $w ?? ['prefix' => $prefix, 'next_ts' => 0, 'slugs' => []];
+    unset($w['teardown_ts']); // widgets are on again; the retry stamp is spent
+    if ($now < (int) ($w['next_ts'] ?? 0)) {
+        $state['_widgets'] = $w;
+        return;
+    }
+    // Widgets move in GB/hour, so they run on their own cadence rather than the
+    // 15s activity poll.
+    $w['next_ts'] = $now + $cfg['widget_interval'];
+
+    foreach (widget_specs($cfg, $prefix) as $spec) {
+        $st = $w['slugs'][$spec['slug']] ?? [];
+        widget_drive($cfg, $spec, $st);
+        $w['slugs'][$spec['slug']] = $st;
+    }
+    $state['_widgets'] = $w;
 }
 
 // ---------------------------------------------------------------------------
 // One-shot subcommands
 // ---------------------------------------------------------------------------
 
+/**
+ * End every activity still marked active, in the caller's own state array.
+ *
+ * dismissal_ttl 0 because every caller is a forced teardown (array stop,
+ * uninstall, a toggle going off, a server rename). A natural completion keeps
+ * its ended_ttl linger - that card is worth a last look. The TTL and the state
+ * change go in one PATCH: the server persists both before it builds the end
+ * push, so the dismissal date rides that push.
+ *
+ * Takes the state by reference so a caller that has more to do to it - the
+ * daemon's shutdown branch, which also tears the widgets down - spends one
+ * load/save cycle instead of two.
+ */
+function end_active(array $cfg, array &$state): void {
+    foreach ($state as $slug => $st) {
+        // Underscore-prefixed keys are metadata (_meta, _widgets), not
+        // activities. is_string first: a numeric JSON key decodes to an int and
+        // $slug[0] would warn on it.
+        if (!is_array($st) || !is_string($slug) || $slug === '' || $slug[0] === '_') {
+            continue;
+        }
+        if (empty($st['active'])) {
+            continue;
+        }
+        $end = $st['end_content'] ?? ['template' => 'generic', 'state' => 'Ended'];
+        pw_patch($cfg, $slug, ['state' => 'ended', 'dismissal_ttl' => 0, 'content' => $end]);
+        $state[$slug]['active'] = false;
+        mlog("teardown: ended $slug");
+    }
+}
+
 function cmd_end_all(array $cfg): void {
     $state = load_state();
-    foreach ($state as $slug => $st) {
-        if (!empty($st['active'])) {
-            $end = $st['end_content'] ?? ['template' => 'generic', 'state' => 'Ended'];
-            pw_patch($cfg, $slug, ['state' => 'ended', 'content' => $end]);
-            $state[$slug]['active'] = false;
-            mlog("end-all: ended $slug");
-        }
-    }
+    end_active($cfg, $state);
+    save_state($state);
+}
+
+function cmd_widgets_clear(array $cfg): void {
+    $state = load_state();
+    widgets_teardown($cfg, $state);
     save_state($state);
 }
 
@@ -1568,19 +2387,26 @@ function cmd_test_activity(array $cfg): void {
     $slug = slug_prefix($cfg['server']) . '-test';
     // Short TTLs so a forgotten test card self-cleans on the server within
     // minutes rather than lingering ~30 min.
-    $c = pw_create($cfg, $slug, 'Unraid · ' . $cfg['server'] . ' test', $cfg['priority'], 120, 600);
+    $c = pw_create($cfg, $slug, 'Unraid · ' . $cfg['server'] . ' test', $cfg['priority'], 120, 600, 60);
     if (!pw_ok($c)) {
         fwrite(STDERR, "create failed: {$c['code']} {$c['body']}\n");
         exit(1);
     }
-    $p = pw_patch($cfg, $slug, ['state' => 'ongoing', 'content' => [
+    $content = [
         'template'     => 'generic',
         'progress'     => 0.42,
         'state'        => 'PushWard test activity',
         'subtitle'     => 'If you see this on your phone, Live Activities work',
         'icon'         => 'bell.badge.fill',
         'accent_color' => 'indigo',
-    ]]);
+    ];
+    // The test card is the first one most users ever see, so it gets the same
+    // Open button every real card carries (WEBUI_PATHS['-test']).
+    $urlAction = unraid_url_action($cfg, $slug);
+    if ($urlAction !== null) {
+        $content['url_action'] = $urlAction;
+    }
+    $p = pw_patch($cfg, $slug, ['state' => 'ongoing', 'content' => $content]);
     if (!pw_ok($p)) {
         fwrite(STDERR, "seed failed: {$p['code']} {$p['body']}\n");
         exit(1);
@@ -1654,13 +2480,17 @@ function run_daemon(array $cfg): void {
             }
             $cfg = $fresh;
         }
-        if (!$cfg['enabled'] || $cfg['key'] === '') {
+        // The daemon now serves two surfaces, so it stays up while either is on.
+        if ((!$cfg['enabled'] && !$cfg['widgets']) || $cfg['key'] === '') {
             // End in-flight activities on disable so the user isn't left with a
             // frozen card until stale_ttl. A cleared key can't authenticate, so
             // only the API is out of reach then, and nothing we can do but exit.
             if ($cfg['key'] !== '') {
-                mlog('Live Activities disabled; ending active activities and exiting');
-                cmd_end_all($cfg);
+                mlog('both surfaces disabled; ending activities, removing widgets and exiting');
+                $state = load_state();
+                end_active($cfg, $state);
+                widgets_teardown($cfg, $state);
+                save_state($state);
             } else {
                 mlog('API key cleared; exiting (cannot end activities without auth)');
             }
@@ -1709,13 +2539,33 @@ switch ($mode) {
         break;
     case 'once':
         // Run a single poll cycle and exit (testing / cron-fallback).
-        if ($cfg['enabled']) {
+        if ($cfg['enabled'] || $cfg['widgets']) {
             tick($cfg);
         }
         break;
+    case 'widgets-clear':
+        // Reachable regardless of the toggles, like end-all: it is what turns
+        // widgets off, and it also has to work after a reboot has dropped the
+        // tmpfs state file (the unconditional prefix seeding covers that).
+        cmd_widgets_clear($cfg);
+        break;
+    case 'widgets-once':
+        // One widget poll, for debugging. Bypasses the next_ts cadence gate so
+        // the effect is immediate. Gated on the toggle because tick_widgets
+        // tears down when it is off, which would make this a silent alias for
+        // widgets-clear.
+        if (!$cfg['widgets']) {
+            fwrite(STDERR, "widgets are disabled (PUSHWARD_WIDGETS_ENABLED); use widgets-clear to remove them\n");
+            break;
+        }
+        $state = load_state();
+        unset($state['_widgets']['next_ts']);
+        tick_widgets($cfg, slug_prefix($cfg['server']), $state);
+        save_state($state);
+        break;
     case 'daemon':
     default:
-        if (!$cfg['enabled']) {
+        if (!$cfg['enabled'] && !$cfg['widgets']) {
             exit(0);
         }
         run_daemon($cfg);
@@ -1723,7 +2573,7 @@ switch ($mode) {
 }
 ]]>
 </INLINE>
-<MD5>63fc36101930079318ab6263a87ca3c6</MD5>
+<MD5>cdd15d0c9df9b28e4cbd671de67a8345</MD5>
 </FILE>
 
 <!-- 5. Monitor watchdog (cron + array events start it). -->
@@ -1754,9 +2604,15 @@ pw_cfg() {  # $1 = key -> value with surrounding quotes stripped
 }
 PUSHWARD_API_KEY="$(pw_cfg PUSHWARD_API_KEY)"
 PUSHWARD_ACTIVITIES_ENABLED="$(pw_cfg PUSHWARD_ACTIVITIES_ENABLED)"
+PUSHWARD_WIDGETS_ENABLED="$(pw_cfg PUSHWARD_WIDGETS_ENABLED)"
 
 [ -n "${PUSHWARD_API_KEY:-}" ] || exit 0
-[ "${PUSHWARD_ACTIVITIES_ENABLED:-true}" = "false" ] && exit 0
+# The daemon serves both surfaces, so it runs while either is on. The defaults
+# are deliberately asymmetric: activities default on when the key is absent (an
+# upgraded box's .cfg predates the widget key), widgets need the literal "true".
+if [ "${PUSHWARD_ACTIVITIES_ENABLED:-true}" = "false" ] && [ "${PUSHWARD_WIDGETS_ENABLED:-false}" != "true" ]; then
+  exit 0
+fi
 [ -f "$MON" ] || exit 0
 
 if pgrep -f "pushward-monitor[.]php daemon" >/dev/null 2>&1; then
@@ -1768,7 +2624,7 @@ setsid php "$MON" daemon >/dev/null 2>&1 &
 exit 0
 ]]>
 </INLINE>
-<MD5>8e1a19df1a621b4239d7b46331378e0b</MD5>
+<MD5>5683d407d0284e2bb7ea7556f1c032d1</MD5>
 </FILE>
 
 <!-- 6. Dashboard server-side proxy (keeps the key off the browser). -->
@@ -1958,14 +2814,16 @@ php "$MON" test-activity
 # update.php writes #file before it runs #command, so on Apply the values the user
 # just saved are already on disk here.
 #
-# Two idempotent jobs, which is why one script serves both buttons:
+# Three idempotent jobs, which is why one script serves both buttons:
 #   1. Register the watchdog cron. A fresh install can end up with no watchdog line
 #      at all (see post-install.sh); by the time a button runs, the plugin is marked
 #      installed in /var/log/plugins, so update_cron always merges it - which also
 #      repairs a box installed before this was fixed. Unconditional on purpose: a
 #      grep for the line proves only that some line mentions the path, so it would
 #      miss a schedule change shipped in an upgrade.
-#   2. Start the monitor if it is not already running.
+#   2. Remove any published Home Screen widgets when the toggle is off and no
+#      daemon is around to do it.
+#   3. Start the monitor if it is not already running.
 #
 # It never kills a running daemon. The daemon re-reads the config on every poll
 # and adopts the new values itself, and when Live Activities are switched off it
@@ -2014,7 +2872,37 @@ if [ -z "$(pw_cfg PUSHWARD_API_KEY)" ]; then
   exit 0
 fi
 
-if [ "$(pw_cfg PUSHWARD_ACTIVITIES_ENABLED)" = "false" ]; then
+# Read both toggles once: every branch below needs them and pw_cfg is a grep.
+ACTIVITIES="$(pw_cfg PUSHWARD_ACTIVITIES_ENABLED)"
+WIDGETS="$(pw_cfg PUSHWARD_WIDGETS_ENABLED)"
+MONITOR="/usr/local/emhttp/plugins/pushward-unraid/pushward-monitor.php"
+STATE="/var/run/pushward/state.json"
+
+# Widgets are handled before the Live Activities early exit: the daemon serves
+# both surfaces, so activities being off no longer means there is nothing to do.
+#
+# The teardown is NOT run on every Apply. It is one GET plus three DELETEs at a
+# 20s timeout each, so on a box with no route out it hangs the progress window
+# for over a minute on the default settings (widgets off, never published), and
+# logs three removals or three 403s for widgets that never existed. Worse, it is
+# load_state -> network -> save_state with no writer lock, so its stale snapshot
+# can rename() over a running daemon's newer write - which is exactly why
+# remove.sh and event-unmounting_disks.sh kill the daemon before calling it. So:
+# let the running daemon do it, and only sweep here when nothing else will.
+# Residual hole: /var/run is tmpfs, so a reboot drops the state file and a
+# toggle-off before the daemon's first publish finds nothing to sweep. remove.sh
+# still sweeps unconditionally, which is what covers an uninstall.
+if [ "$WIDGETS" = "true" ]; then
+  echo "Home Screen widgets are Enabled; the monitor publishes them every widget interval."
+elif [ -n "$(monitor_pid)" ]; then
+  echo "Home Screen widgets are Disabled; the monitor removes them on its next poll."
+elif grep -q '"_widgets"' "$STATE" 2>/dev/null && [ -x "$MONITOR" ] && php "$MONITOR" widgets-clear >/dev/null 2>&1; then
+  echo "Home Screen widgets are Disabled; any published widgets have been removed."
+else
+  echo "Home Screen widgets are Disabled."
+fi
+
+if [ "$ACTIVITIES" = "false" ] && [ "$WIDGETS" != "true" ]; then
   if [ -n "$(monitor_pid)" ]; then
     echo "Live Activities are Disabled; the monitor ends its activities and exits on its next poll."
   else
@@ -2023,9 +2911,18 @@ if [ "$(pw_cfg PUSHWARD_ACTIVITIES_ENABLED)" = "false" ]; then
   exit 0
 fi
 
+# What the daemon is running FOR, so the three lines below cannot announce a
+# "Live Activity monitor" on a box where activities are off and it is up for the
+# widgets alone. Reaching here with activities off means widgets are on.
+if [ "$ACTIVITIES" = "false" ]; then
+  ROLE="Widget monitor (Live Activities are Disabled)"
+else
+  ROLE="Live Activity monitor"
+fi
+
 PID="$(monitor_pid)"
 if [ -n "$PID" ]; then
-  echo "Live Activity monitor already running (pid $PID)."
+  echo "$ROLE already running (pid $PID)."
   exit 0
 fi
 
@@ -2048,14 +2945,14 @@ for _ in $(seq 1 10); do
 done
 
 if [ -n "$PID" ]; then
-  echo "Live Activity monitor started (pid $PID)."
+  echo "$ROLE started (pid $PID)."
 else
-  echo "Live Activity monitor did not start. Check /var/log/pushward-monitor.log"
+  echo "$ROLE did not start. Check /var/log/pushward-monitor.log"
 fi
 exit 0
 ]]>
 </INLINE>
-<MD5>861eb0f7ce0dbf2e60ac755e90a5fc9b</MD5>
+<MD5>84b4fb2dc5838bbad6d690b79d0115f8</MD5>
 </FILE>
 
 <!-- 8. Array event: start the monitor when disks mount. -->
@@ -2130,11 +3027,29 @@ function pw_val($cfg, $key, $default = '') {
 function pw_enabled($cfg, $key, $default = 'true') {
     return ($cfg[$key] ?? $default) !== 'false';  // only the literal "false" is off
 }
-function pw_yesno($cfg, $key, $default) {
-    $v = pw_enabled($cfg, $key, $default);
-    $t = $v ? ' selected' : '';
-    $f = $v ? '' : ' selected';
-    return "<option value='true'$t>Enabled</option><option value='false'$f>Disabled</option>";
+// One <option> list from a value => label map, with the stored value selected.
+// A value that is not in the map falls back to $default instead of to "on":
+// pw_enabled's "anything but the literal false" suits the activity toggles but
+// not the widgets, where the daemon and watchdog want the literal "true", so an
+// empty value rendered Enabled here while every consumer read it as off. The
+// default map is the on/off pair; the alert level brings its own three.
+function pw_options($cfg, $key, $default, array $opts = ['true' => 'Enabled', 'false' => 'Disabled']) {
+    $cur = (string) ($cfg[$key] ?? $default);
+    if (!isset($opts[$cur])) { $cur = $default; }
+    $out = '';
+    foreach ($opts as $v => $label) {
+        $sel = $v === $cur ? ' selected' : '';
+        $out .= "<option value='$v'$sel>$label</option>";
+    }
+    return $out;
+}
+// Placeholder for the web UI URL field: the base URL the "Open" button on a Live
+// Activity points at when the field is blank, so the operator can see what
+// auto-detection resolved to. Returns the finished, escaped text.
+function pw_webui_placeholder() {
+    $ini = @parse_ini_file('/var/local/emhttp/nginx.ini') ?: [];
+    $auto = (string) ($ini['NGINX_DEFAULTURL'] ?? '');
+    return $auto === '' ? 'auto' : 'auto (' . htmlspecialchars($auto, ENT_QUOTES) . ')';
 }
 
 // Which importances dynamix actually hands to notification agents. In each level's
@@ -2159,17 +3074,21 @@ function pw_notify_agent_levels() {
 }
 
 // One derivation of the monitor's situation, so the status chip and the log-panel
-// note cannot contradict each other. Red is reserved for the state that cannot heal
-// itself: with no watchdog line in cron nothing will ever start the daemon. Running
-// without the cron is only a warning - it works now, but has no restart net.
-function pw_monitor_state($activities, $daemon, $cronOk) {
-    if (!$activities) { return 'off'; }
+// note cannot contradict each other. $wanted is "either surface is switched on",
+// the same condition watchdog.sh and the daemon use to decide whether to run:
+// the daemon serves widgets too, so keying on Live Activities alone reported it
+// Disabled while it was up and publishing, and apply.sh said the opposite on the
+// same button press. Red is reserved for the state that cannot heal itself: with
+// no watchdog line in cron nothing will ever start the daemon. Running without
+// the cron is only a warning - it works now, but has no restart net.
+function pw_monitor_state($wanted, $daemon, $cronOk) {
+    if (!$wanted)     { return 'off'; }
     if ($daemon)      { return $cronOk ? 'running' : 'no-net'; }
     return $cronOk ? 'pending' : 'stuck';
 }
 function pw_monitor_chip($state) {
     $t = [
-        'off'     => ['warn', 'Disabled',    'Live Activities are off'],
+        'off'     => ['warn', 'Disabled',    'activities and widgets are off'],
         'running' => ['ok',   'Running',     ''],
         'no-net'  => ['warn', 'Running',     'watchdog cron missing'],
         'pending' => ['warn', 'Not running', 'starts within a minute'],
@@ -2180,7 +3099,7 @@ function pw_monitor_chip($state) {
 }
 function pw_log_note($state) {
     $t = [
-        'off'     => 'No log yet: Live Activities are set to Disabled.',
+        'off'     => 'No log yet: Live Activities and Home Screen widgets are both Disabled.',
         'running' => 'Monitor running, no log lines yet.',
         'no-net'  => 'Monitor running, no log lines yet.',
         'pending' => 'No log yet: the watchdog starts the monitor within a minute. Reload this page.',
@@ -2190,6 +3109,9 @@ function pw_log_note($state) {
 }
 $configured = !empty($cfg['PUSHWARD_API_KEY']);
 $activities = pw_enabled($cfg, 'PUSHWARD_ACTIVITIES_ENABLED');
+// Widgets read with the daemon's polarity, not pw_enabled's: watchdog.sh and the
+// daemon both start only on the literal "true".
+$widgets = ($cfg['PUSHWARD_WIDGETS_ENABLED'] ?? 'false') === 'true';
 
 // Live status (best-effort, short timeouts so the page never hangs).
 $me = null; $actCode = 0; $daemon = false; $cronOk = false; $logTail = ''; $monState = 'off';
@@ -2212,7 +3134,7 @@ if ($configured) {
     // update_cron merges the plugin cron files into /etc/cron.d/root, so read that
     // file rather than shelling out again.
     $cronOk = str_contains((string) @file_get_contents('/etc/cron.d/root'), "plugins/{$plugin}/watchdog.sh");
-    $monState = pw_monitor_state($activities, $daemon, $cronOk);
+    $monState = pw_monitor_state($activities || $widgets, $daemon, $cronOk);
     if (is_file('/var/log/pushward-monitor.log')) {
         $logTail = htmlspecialchars(implode('', array_slice((array) @file('/var/log/pushward-monitor.log'), -10)), ENT_QUOTES);
     }
@@ -2330,29 +3252,41 @@ PushWard API key:
 Server display name:
 : <input type="text" name="PUSHWARD_SERVER_NAME" maxlength="100" value="<?= pw_val($cfg,'PUSHWARD_SERVER_NAME','Unraid') ?>">
 
+Alert notification level:
+: <select name="PUSHWARD_ALERT_LEVEL"><?= pw_options($cfg, 'PUSHWARD_ALERT_LEVEL', 'time-sensitive', ['active' => 'Normal', 'time-sensitive' => 'Time Sensitive', 'critical' => 'Critical']) ?></select>
+
 Live Activities:
-: <select name="PUSHWARD_ACTIVITIES_ENABLED"><?= pw_yesno($cfg,'PUSHWARD_ACTIVITIES_ENABLED','true') ?></select>
+: <select name="PUSHWARD_ACTIVITIES_ENABLED"><?= pw_options($cfg,'PUSHWARD_ACTIVITIES_ENABLED','true') ?></select>
 
 Track parity check / rebuild:
-: <select name="PUSHWARD_TRACK_PARITY"><?= pw_yesno($cfg,'PUSHWARD_TRACK_PARITY','true') ?></select>
+: <select name="PUSHWARD_TRACK_PARITY"><?= pw_options($cfg,'PUSHWARD_TRACK_PARITY','true') ?></select>
 
 Track appdata backup:
-: <select name="PUSHWARD_TRACK_BACKUP"><?= pw_yesno($cfg,'PUSHWARD_TRACK_BACKUP','true') ?></select>
+: <select name="PUSHWARD_TRACK_BACKUP"><?= pw_options($cfg,'PUSHWARD_TRACK_BACKUP','true') ?></select>
 
 Track mover:
-: <select name="PUSHWARD_TRACK_MOVER"><?= pw_yesno($cfg,'PUSHWARD_TRACK_MOVER','true') ?></select>
+: <select name="PUSHWARD_TRACK_MOVER"><?= pw_options($cfg,'PUSHWARD_TRACK_MOVER','true') ?></select>
 
 Track VM backup:
-: <select name="PUSHWARD_TRACK_VMBACKUP"><?= pw_yesno($cfg,'PUSHWARD_TRACK_VMBACKUP','true') ?></select>
+: <select name="PUSHWARD_TRACK_VMBACKUP"><?= pw_options($cfg,'PUSHWARD_TRACK_VMBACKUP','true') ?></select>
 
 Track UPS on battery:
-: <select name="PUSHWARD_TRACK_UPS"><?= pw_yesno($cfg,'PUSHWARD_TRACK_UPS','true') ?></select>
+: <select name="PUSHWARD_TRACK_UPS"><?= pw_options($cfg,'PUSHWARD_TRACK_UPS','true') ?></select>
 
 Poll interval (seconds):
 : <input type="number" name="PUSHWARD_POLL_INTERVAL" min="5" max="300" value="<?= pw_val($cfg,'PUSHWARD_POLL_INTERVAL','15') ?>">
 
 Activity priority (0-10):
 : <input type="number" name="PUSHWARD_ACTIVITY_PRIORITY" min="0" max="10" value="<?= pw_val($cfg,'PUSHWARD_ACTIVITY_PRIORITY','5') ?>">
+
+Unraid web UI URL:
+: <input type="text" name="PUSHWARD_WEBUI_URL" maxlength="200" placeholder="<?= pw_webui_placeholder() ?>" value="<?= pw_val($cfg,'PUSHWARD_WEBUI_URL') ?>">
+
+Home Screen widgets:
+: <select name="PUSHWARD_WIDGETS_ENABLED"><?= pw_options($cfg,'PUSHWARD_WIDGETS_ENABLED','false') ?></select>
+
+Widget refresh interval (seconds):
+: <input type="number" name="PUSHWARD_WIDGET_INTERVAL" min="60" max="3600" value="<?= pw_val($cfg,'PUSHWARD_WIDGET_INTERVAL','300') ?>">
 
 &nbsp;
 : <input type="submit" name="apply" value="Apply"> <input type="button" value="Done" onclick="done()">
@@ -2449,7 +3383,7 @@ function pwKeepKey() {
 </script>
 ]]>
 </INLINE>
-<MD5>9577612acb221607fd0edd5857c05c44</MD5>
+<MD5>e490426ba55ad40e2c53ac08f6afd256</MD5>
 </FILE>
 
 <!-- 11. Activities tab page (live dashboard). -->
@@ -2868,13 +3802,16 @@ for _ in $(seq 1 30); do
 done
 pkill -KILL -f "$PAT" 2>/dev/null || true
 php /usr/local/emhttp/plugins/pushward-unraid/pushward-monitor.php end-all >/dev/null 2>&1 || true
+# Widgets are server-side rows that would otherwise stay in the user's widget
+# picker after the plugin is gone. Runs before the code is deleted below.
+php /usr/local/emhttp/plugins/pushward-unraid/pushward-monitor.php widgets-clear >/dev/null 2>&1 || true
 rm -f /boot/config/plugins/dynamix/notifications/agents/PushWard
 rm -f /boot/config/plugins/dynamix/notifications/agents-disabled/PushWard
 rm -f /boot/config/plugins/pushward-unraid/pushward-unraid.cron
 /usr/local/sbin/update_cron >/dev/null 2>&1 || true
 rm -rf /usr/local/emhttp/plugins/pushward-unraid
 rm -rf /var/run/pushward
-echo "Removed the agent, monitor, settings/dashboard pages and cron."
+echo "Removed the agent, monitor, widgets, settings/dashboard pages and cron."
 echo "Persistent config under /boot/config/plugins/pushward-unraid/ left intact."
 ]]>
 </INLINE>

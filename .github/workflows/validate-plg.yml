@@ -63,7 +63,7 @@ jobs:
           fi
 
       - name: Install validators
-        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends libxml2-utils shellcheck php-cli >/dev/null
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends libxml2-utils shellcheck php-cli php-mbstring >/dev/null
 
       - name: Validate XML
         run: xmllint --noout pushward-unraid.plg
@@ -208,6 +208,104 @@ jobs:
               || { echo "::error::pattern [$p] does not match the launched argv [$argv]"; exit 1; }
           done
 
+      - name: Check the notification level mapping
+        run: |
+          # Drive the real agent with a stub curl and a temp cfg, so this covers
+          # the whole script rather than an extracted fragment. Unraid hands the
+          # agent only normal/warning/alert, so which level an alert lands on is
+          # the operator's choice; the subject rule may only ever RAISE, because
+          # Unraid's own monitor sends "Notice [...] Parity-Check finished (N
+          # errors)" at importance warning and demoting on that prefix would
+          # silence a parity check that found problems.
+          #
+          # collapse_id is asserted with the level, not left to the eye: it is the
+          # whole reason a repeating SMART warning stops stacking, and every way of
+          # breaking it (dropping the key, keying it off the subject, dropping the
+          # server name, sending it blank) still delivers a notification and shows
+          # up only as banners piling up on someone's phone.
+          # The agent is extracted under the basename of its INSTALL path
+          # (<FILE Name=".../notifications/agents/PushWard">), not its src/ name,
+          # so it lands at /tmp/plg/PushWard.
+          mkdir -p /tmp/stub
+          cat > /tmp/stub/curl <<'STUB'
+          #!/bin/bash
+          for ((i=1;i<=$#;i++)); do
+            if [ "${!i}" = "-d" ]; then j=$((i+1)); printf '%s\n' "${!j}" >> "$STUB_LOG"; fi
+          done
+          printf '%s' "${STUB_CODE:-200}"
+          STUB
+          chmod +x /tmp/stub/curl
+          printf '#!/bin/sh\nexit 0\n' > /tmp/stub/logger && chmod +x /tmp/stub/logger
+          export PATH=/tmp/stub:$PATH
+          printf 'PUSHWARD_API_KEY="hlk_x"\nPUSHWARD_SERVER_NAME="Tower"\n' > /tmp/agent.cfg
+          export PUSHWARD_CFG=/tmp/agent.cfg PUSHWARD_STATE=/tmp/agent-state.json STUB_LOG=/tmp/agent.log
+          echo '{"_meta":{"prefix":"tower"},"tower-array":{"active":true}}' > /tmp/agent-state.json
+
+          check() {  # event, subject, importance, expected level, expected slug, expected collapse_id
+            : > /tmp/agent.log
+            EVENT="$1" SUBJECT="$2" IMPORTANCE="$3" DESCRIPTION=d CONTENT="" LINK=http://x TIMESTAMP=1 \
+              bash /tmp/plg/PushWard
+            got="$(php -r '$j = json_decode(file_get_contents("/tmp/agent.log"), true);
+              printf("%s %s %s", $j["level"] ?? "?", $j["activity_slug"] ?? "-", $j["collapse_id"] ?? "-");')"
+            if [ "$got" != "$4 $5 $6" ]; then
+              echo "FAIL: [$1 / $2 / $3] -> '$got', want '$4 $5 $6'" >&2
+              exit 1
+            fi
+          }
+          check "Unraid Disk 1 error"  "Alert [T] - disk"    alert   time-sensitive - tower-unraid-disk-1-error
+          check "Unraid Disk 1 SMART"  "Warning [T] - smart" warning active         - tower-unraid-disk-1-smart
+          check "Community Apps"       "Notice [T] - update" normal  passive        - tower-community-apps
+          check "Unraid array errors"  "Alert [T] - errors"  ""      time-sensitive - tower-unraid-array-errors
+          check "Unraid Parity-Check"  "Notice [T] - done"   warning active         tower-array tower-unraid-parity-check
+          # The repeating SMART subject carries a ticking attribute value; the key
+          # must not move with it, or the banners stack again.
+          check "Unraid Disk 1 SMART"  "Warning [T] - smart 199" warning active - tower-unraid-disk-1-smart
+          # No event, no key: a blank collapse_id would make every unlabelled
+          # notification replace every other one.
+          check ""                     "Notice [T] - update" normal  passive        - -
+
+          # Past the 64-char server cap the key keeps a readable prefix and a sha1
+          # tail (31 + 1 + 32), rather than truncating two long events onto one key.
+          : > /tmp/agent.log
+          EVENT="unraid-disk-error-on-a-very-long-event-name-that-exceeds-the-cap-by-a-lot" \
+            SUBJECT=S IMPORTANCE=normal DESCRIPTION=d LINK=x TIMESTAMP=1 bash /tmp/plg/PushWard
+          php -r '$c = json_decode(file_get_contents("/tmp/agent.log"), true)["collapse_id"] ?? "";
+            if (strlen($c) !== 64) { fwrite(STDERR, "FAIL: long-event key is " . strlen($c) . " chars, want 64\n"); exit(1); }'
+
+          # A state key is never removed, so the slug is claimed only while the
+          # activity is live: with active=false the notification must carry no slug.
+          echo '{"_meta":{"prefix":"tower"},"tower-array":{"active":false}}' > /tmp/agent-state.json
+          check "Unraid Parity-Check" "Notice [T] - done" warning active - tower-unraid-parity-check
+          echo '{"_meta":{"prefix":"tower"},"tower-array":{"active":true}}' > /tmp/agent-state.json
+
+          # critical is opt-in: it bypasses Do Not Disturb, and Unraid's alert
+          # tier is not curated for 3am.
+          printf 'PUSHWARD_ALERT_LEVEL="critical"\n' >> /tmp/agent.cfg
+          check "Unraid Disk 1 error" "Alert [T] - disk" alert critical - tower-unraid-disk-1-error
+          # An unrecognised stored level falls back, matching the settings page.
+          printf 'PUSHWARD_ALERT_LEVEL="urgent"\n' >> /tmp/agent.cfg
+          check "Unraid Disk 1 error" "Alert [T] - disk" alert time-sensitive - tower-unraid-disk-1-error
+          # Two boxes on one account must not collapse each other's identical event.
+          printf 'PUSHWARD_SERVER_NAME="Backup"\n' >> /tmp/agent.cfg
+          check "Unraid Disk 1 error" "Alert [T] - disk" alert time-sensitive - backup-unraid-disk-1-error
+
+          # A 422 with a slug means the activity was swept between the monitor's
+          # last write and this notification; retry once without it rather than
+          # let a raced link swallow a disk-failure alert.
+          : > /tmp/agent.log
+          STUB_CODE=422 EVENT="Unraid Parity-Check" SUBJECT=N IMPORTANCE=warning DESCRIPTION=d \
+            LINK=x TIMESTAMP=1 bash /tmp/plg/PushWard
+          test "$(wc -l < /tmp/agent.log)" = "2" || { echo "FAIL: no retry after 422" >&2; exit 1; }
+          php -r '$l = file("/tmp/agent.log"); $second = json_decode($l[1], true);
+            if (isset($second["activity_slug"])) { fwrite(STDERR, "FAIL: retry kept the slug\n"); exit(1); }'
+
+          # A 5xx must not be retried into a duplicate notification.
+          : > /tmp/agent.log
+          STUB_CODE=500 EVENT="Unraid Parity-Check" SUBJECT=N IMPORTANCE=warning DESCRIPTION=d \
+            LINK=x TIMESTAMP=1 bash /tmp/plg/PushWard
+          test "$(wc -l < /tmp/agent.log)" = "1" || { echo "FAIL: retried a 5xx" >&2; exit 1; }
+          echo "notification level mapping ok"
+
       - name: Lint PHP and the page JS
         run: |
           # PHP files: lint. The .page files have a "header\n---\nbody" layout;
@@ -229,6 +327,25 @@ jobs:
               if ($g !== $w) { fwrite(STDERR, "steps_current($i,$t)=$g want $w\n"); exit(1); }
             }
             echo "steps_current ok\n";'
+
+          # The VM-backup steps row is built from one planned-VM list, so the
+          # labels and the weights come out one per VM in the same order. A label
+          # past the 32-rune cap 422s the whole update, and a colours array that
+          # is all-empty costs a structural push for no visible change.
+          echo "== vmbackup step label/colour assertions =="
+          php -r 'define("PUSHWARD_NO_MAIN", 1); require "/tmp/plg/pushward-monitor.php";
+            $vms = ["win11", "ubuntu", str_repeat("x", 60), "both"];
+            $labels = vmbackup_step_labels($vms);
+            if (count($labels) !== 4) { fwrite(STDERR, "labels: expected one per VM\n"); exit(1); }
+            if (mb_strlen($labels[2], "UTF-8") !== 32) { fwrite(STDERR, "labels: not truncated to the cap\n"); exit(1); }
+            // A VM in both maps failed: red wins, or a failure reads as a skip.
+            $c = vmbackup_step_colors($vms, ["ubuntu" => true, "both" => true], [$vms[2] => true, "both" => true]);
+            if ($c !== ["", "red", "orange", "red"]) { fwrite(STDERR, "colors: " . json_encode($c) . "\n"); exit(1); }
+            if (vmbackup_step_colors($vms, [], []) !== []) { fwrite(STDERR, "colors: an all-empty array must be dropped\n"); exit(1); }
+            // No virsh on the runner, so nothing can be sized: the row falls back
+            // to equal widths instead of inventing a shape.
+            if (vmbackup_step_weights($vms) !== []) { fwrite(STDERR, "weights: unsized VMs must leave the row at equal widths\n"); exit(1); }
+            echo "vmbackup steps ok\n";'
           for p in pushward-settings.page pushward-activities.page; do
             echo "== php -l $p (body) =="
             awk 'f{print} /^---$/{f=1}' "/tmp/plg/$p" > "/tmp/plg/$p.body.php"

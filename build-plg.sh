@@ -4,7 +4,7 @@
 set -euo pipefail
 SRC="$(cd "$(dirname "$0")/src" && pwd)"
 OUT="${1:-$(dirname "$0")/pushward-unraid.plg}"
-VERSION="2026.07.30d"
+VERSION="2026.08.31"
 
 # Guard: a literal ]]> in any embedded TEXT file would break its CDATA section.
 # Skip *.png: the icon is base64-encoded (icon_file), never embedded raw, so a
@@ -75,7 +75,15 @@ cat <<XMLHEAD
 
 <CHANGES>
 ###$VERSION
-- Internal tidy-up only: no behaviour changes
+- Pick which PushWard level an Unraid Alert becomes: Normal, Time Sensitive (the new default) or Critical, which breaks through Do Not Disturb and the silent switch
+- Warnings stay Normal; everything below stays quiet
+- Repeats of the same alert replace the previous banner instead of stacking one per repeat; the app's list still keeps every one
+- Tap a notification about a job the plugin is tracking to open that Live Activity
+- Live Activity cards carry an Open button that goes to the matching page in the web UI; set "Unraid web UI URL" if you reach the server by another name
+- Label VM backup steps with the VM name: red for one that failed, orange for one the backup could not find
+- Clear the cards from the Lock Screen as soon as the array stops or the plugin is uninstalled, instead of leaving them to go stale
+- New optional Home Screen widgets: array fill, free space per disk and pool plus the UPS, and a status list with array state, parity result and mover
+- Widgets are off by default and need the widgets capability on your API key
 ###2026.07.30b
 - Honour a Live Activities "Disabled" setting saved from a Windows editor: a carriage return in the config file made the monitor read the value as enabled and start anyway
 - Never leave a stray marker behind if the box is shut down mid-install, which could make the plugin refuse to install or update until a reboot

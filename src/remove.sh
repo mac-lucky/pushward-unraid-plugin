@@ -10,11 +10,14 @@ for _ in $(seq 1 30); do
 done
 pkill -KILL -f "$PAT" 2>/dev/null || true
 php /usr/local/emhttp/plugins/pushward-unraid/pushward-monitor.php end-all >/dev/null 2>&1 || true
+# Widgets are server-side rows that would otherwise stay in the user's widget
+# picker after the plugin is gone. Runs before the code is deleted below.
+php /usr/local/emhttp/plugins/pushward-unraid/pushward-monitor.php widgets-clear >/dev/null 2>&1 || true
 rm -f /boot/config/plugins/dynamix/notifications/agents/PushWard
 rm -f /boot/config/plugins/dynamix/notifications/agents-disabled/PushWard
 rm -f /boot/config/plugins/pushward-unraid/pushward-unraid.cron
 /usr/local/sbin/update_cron >/dev/null 2>&1 || true
 rm -rf /usr/local/emhttp/plugins/pushward-unraid
 rm -rf /var/run/pushward
-echo "Removed the agent, monitor, settings/dashboard pages and cron."
+echo "Removed the agent, monitor, widgets, settings/dashboard pages and cron."
 echo "Persistent config under /boot/config/plugins/pushward-unraid/ left intact."
