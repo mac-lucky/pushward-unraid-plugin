@@ -4,7 +4,7 @@
 set -euo pipefail
 SRC="$(cd "$(dirname "$0")/src" && pwd)"
 OUT="${1:-$(dirname "$0")/pushward-unraid.plg}"
-VERSION="2026.08.31"
+VERSION="2026.10.08"
 
 # Guard: a literal ]]> in any embedded TEXT file would break its CDATA section.
 # Skip *.png: the icon is base64-encoded (icon_file), never embedded raw, so a
@@ -75,6 +75,12 @@ cat <<XMLHEAD
 
 <CHANGES>
 ###$VERSION
+- Optional end-to-end encryption: paste the key from the PushWard app (1.17 or later) and the title, subtitle, body and link of every notification are encrypted on this server before they leave it, so only your devices can read them
+- PushWard still sees the level, server name, timestamp and importance; Live Activities and widgets are not encrypted
+- A wrong key does not silence anything: alerts still arrive, without the details, and the Settings tab flags the key
+- Optional repeat for Unraid Alerts: they come back every 5 minutes (adjustable) until you tap Acknowledge on a device, for up to an hour by default
+- When PushWard can not take another repeating alert, it is delivered once as an ordinary notification instead of being dropped
+###2026.08.31
 - Pick which PushWard level an Unraid Alert becomes: Normal, Time Sensitive (the new default) or Critical, which breaks through Do Not Disturb and the silent switch
 - Warnings stay Normal; everything below stays quiet
 - Repeats of the same alert replace the previous banner instead of stacking one per repeat; the app's list still keeps every one

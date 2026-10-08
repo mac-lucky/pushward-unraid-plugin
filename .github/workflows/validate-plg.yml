@@ -3,7 +3,7 @@ name: Validate plugin
 on:
   push:
     branches: [main]
-    paths: ['pushward-unraid.plg', 'src/**', 'build-plg.sh', '.github/workflows/validate-plg.yml']
+    paths: ['pushward-unraid.plg', 'src/**', 'tests/**', 'build-plg.sh', '.github/workflows/validate-plg.yml']
   pull_request:
   workflow_dispatch:
 
@@ -227,15 +227,43 @@ jobs:
           # (<FILE Name=".../notifications/agents/PushWard">), not its src/ name,
           # so it lands at /tmp/plg/PushWard.
           mkdir -p /tmp/stub
+          # The stub logs each notification payload, answers with the next
+          # status from STUB_CODES (the last one repeats; STUB_CODE for a single
+          # one) and writes STUB_BODY to the -o file on a non-2xx, the way the
+          # server explains a refusal. A receipt cancel answers STUB_CANCEL_CODE
+          # (000 fails like a dead network) and is kept apart from the payload
+          # log; /tmp/agent-calls records the order of both.
           cat > /tmp/stub/curl <<'STUB'
           #!/bin/bash
+          out=/dev/null; data=""; url=""
           for ((i=1;i<=$#;i++)); do
-            if [ "${!i}" = "-d" ]; then j=$((i+1)); printf '%s\n' "${!j}" >> "$STUB_LOG"; fi
+            j=$((i+1))
+            case "${!i}" in
+              -d) data="${!j}" ;;
+              -o) out="${!j}" ;;
+              http*) url="${!i}" ;;
+            esac
           done
-          printf '%s' "${STUB_CODE:-200}"
+          if [ "${url%/notifications/receipts/cancel}" != "$url" ]; then
+            printf 'cancel %s\n' "$data" >> /tmp/agent-calls
+            code="${STUB_CANCEL_CODE:-200}"
+            [ "$code" != 000 ] || { printf 000; exit 7; }
+            printf '{"canceled":1}' > "$out"; printf '%s' "$code"; exit 0
+          fi
+          printf 'notify\n' >> /tmp/agent-calls
+          printf '%s\n' "$data" >> "$STUB_LOG"
+          read -r -a codes <<< "${STUB_CODES:-${STUB_CODE:-200}}"
+          n=$(wc -l < "$STUB_LOG")
+          code="${codes[n-1]:-${codes[-1]}}"
+          case "$code" in 2*) printf '{}' ;; *) printf '%s' "${STUB_BODY:-}" ;; esac > "$out"
+          printf '%s' "$code"
           STUB
           chmod +x /tmp/stub/curl
-          printf '#!/bin/sh\nexit 0\n' > /tmp/stub/logger && chmod +x /tmp/stub/logger
+          cat > /tmp/stub/logger <<'STUB'
+          #!/bin/sh
+          printf '%s\n' "$*" >> /tmp/agent-syslog
+          STUB
+          chmod +x /tmp/stub/logger
           export PATH=/tmp/stub:$PATH
           printf 'PUSHWARD_API_KEY="hlk_x"\nPUSHWARD_SERVER_NAME="Tower"\n' > /tmp/agent.cfg
           export PUSHWARD_CFG=/tmp/agent.cfg PUSHWARD_STATE=/tmp/agent-state.json STUB_LOG=/tmp/agent.log
@@ -305,6 +333,306 @@ jobs:
             LINK=x TIMESTAMP=1 bash /tmp/plg/PushWard
           test "$(wc -l < /tmp/agent.log)" = "1" || { echo "FAIL: retried a 5xx" >&2; exit 1; }
           echo "notification level mapping ok"
+
+          # End-to-end encryption. The agent seals with PHP it carries inline (the
+          # flash-drive copy can not lean on the plugin directory), so pull that
+          # block out between its markers and hold it to the published pw1
+          # vectors with their fixed nonces. The vector file is pinned, so it can
+          # not be edited into agreement with a broken seal.
+          echo "82a670607d831801d5f9054da8d500086c8324146b133d17967966d55493c265  tests/e2e-vectors-v1.json" \
+            | sha256sum -c --quiet || { echo "::error::tests/e2e-vectors-v1.json is not the published pw1 vector file"; exit 1; }
+          { echo '<?php'; awk '/\/\/ pw-e2e begin/,/\/\/ pw-e2e end/' /tmp/plg/PushWard; } > /tmp/pw-e2e.php
+          grep -q 'function pw_e2e_seal_plaintext' /tmp/pw-e2e.php || { echo "::error::no pw-e2e block in the agent"; exit 1; }
+          php -r 'require "/tmp/pw-e2e.php";
+            $v = json_decode(file_get_contents("tests/e2e-vectors-v1.json"), true);
+            $sealed = 0; $serialized = 0;
+            foreach ($v["seal"] as $t) {
+              $key = pw_e2e_key($t["key_hex"]);
+              $env = pw_e2e_seal_plaintext($key, $t["plaintext"], hex2bin($t["nonce_hex"]));
+              if (pw_e2e_kid($key) !== $t["kid"] || $env !== $t["envelope"]) { fwrite(STDERR, "FAIL: seal vector {$t["name"]}\n"); exit(1); }
+              $sealed++;
+              // Where a vector holds only what a sender writes, the agent must
+              // write the same bytes (padding aside).
+              if (json_decode($t["plaintext"], true) === $t["expect"]) {
+                $e = $t["expect"];
+                $json = json_encode(pw_e2e_fields($e["title"], $e["body"], $e["subtitle"] ?? "", $e["url"] ?? ""), PW_E2E_JSON);
+                if ($json !== rtrim($t["plaintext"], " ")) { fwrite(STDERR, "FAIL: serialized {$t["name"]} as $json\n"); exit(1); }
+                $serialized++;
+              }
+            }
+            if ($sealed < 9 || $serialized < 5) { fwrite(STDERR, "FAIL: only $sealed seal and $serialized serializer vectors ran\n"); exit(1); }
+            foreach (["hlk_" . str_repeat("a", 60), "hla_" . str_repeat("a", 60), str_repeat("a", 63), str_repeat("g", 64)] as $bad) {
+              try { pw_e2e_key($bad); fwrite(STDERR, "FAIL: accepted the key $bad\n"); exit(1); } catch (InvalidArgumentException $e) {}
+            }
+            // Python json.dumps(ensure_ascii=False) leaves U+2028 raw; so must this.
+            if (json_encode(pw_e2e_fields("a\u{2028}/b", "c", "", ""), PW_E2E_JSON) !== "{\"title\":\"a\u{2028}/b\",\"body\":\"c\"}") {
+              fwrite(STDERR, "FAIL: U+2028 or a slash is escaped in the sealed JSON\n"); exit(1);
+            }
+            if (pw_e2e_key(" 000102030405060708090A0B0C0D0E0F\n101112131415161718191a1b1c1d1e1f ") !== hex2bin($v["seal"][0]["key_hex"])) {
+              fwrite(STDERR, "FAIL: a key with spaces or upper case did not parse\n"); exit(1);
+            }
+            echo "pw1 vectors ok ($sealed sealed, $serialized serialized)\n";'
+
+          # The settings page shows a Key ID it derives on its own; it has to be
+          # the one the app shows, so hold it to the vectors too.
+          { echo '<?php'; awk '/^function pw_e2e_status\(/,/^}/' /tmp/plg/pushward-settings.page; } > /tmp/page-e2e.php
+          php -r 'require "/tmp/page-e2e.php";
+            foreach (json_decode(file_get_contents("tests/e2e-vectors-v1.json"), true)["seal"] as $t) {
+              $got = pw_e2e_status(" " . strtoupper($t["key_hex"]) . "\n");
+              if ($got[1] !== "Key ID " . $t["kid"]) { fwrite(STDERR, "FAIL: the page shows " . json_encode($got) . " for kid {$t["kid"]}\n"); exit(1); }
+            }
+            if (pw_e2e_status("") !== null || pw_e2e_status("hlk_x")[0] !== "bad" || pw_e2e_status("abcd")[0] !== "bad") {
+              fwrite(STDERR, "FAIL: the page misreads an empty or invalid key\n"); exit(1);
+            }'
+
+          # The test opens what the agent sends with its own opener, written from
+          # the format rather than from the agent, so a bug the seal and an
+          # opener could share does not cancel out. It opens a vector first.
+          cat > /tmp/pw1-open.php <<'PHP'
+          <?php
+          function fail(string $why) { fwrite(STDERR, "FAIL: $why\n"); exit(1); }
+          function pw1_open(string $keyHex, string $envelope): string {
+              $key = hex2bin($keyHex);
+              $kid = bin2hex(hash_hkdf('sha256', $key, 4, 'pushward/e2e/v1/kid'));
+              if (strlen($envelope) > 3072) { fail('envelope is ' . strlen($envelope) . ' characters, over 3072'); }
+              if (!preg_match('/^pw1\.([0-9a-f]{8})\.([A-Za-z0-9_-]+)$/', $envelope, $m) || $m[1] !== $kid) { fail("not a pw1 envelope for key $kid"); }
+              $raw = base64_decode(strtr($m[2], '-_', '+/'), true);
+              $plain = openssl_decrypt(substr($raw, 12, -16), 'aes-256-gcm', hash_hkdf('sha256', $key, 32, 'pushward/e2e/v1/enc'),
+                  OPENSSL_RAW_DATA, substr($raw, 0, 12), substr($raw, -16), "pw1.$kid");
+              if ($plain === false) { fail('the envelope does not open'); }
+              return $plain;
+          }
+          // What the agent sent, one JSON object per stub log line, and the
+          // sealed message inside it, checked for the 64-byte padding.
+          function sent(int $i = 0): array { return json_decode(file('/tmp/agent.log')[$i], true, 512, JSON_THROW_ON_ERROR); }
+          function opened(string $keyHex, array $j): array {
+              foreach (['title', 'subtitle', 'body', 'url'] as $k) { if (array_key_exists($k, $j)) { fail("a sealed payload carries $k in the clear"); } }
+              $plain = pw1_open($keyHex, $j['encrypted'] ?? '');
+              $padded = intdiv(strlen($plain) + 63, 64) * 64;
+              if ($padded <= 2266 && strlen($plain) !== $padded) { fail('plaintext of ' . strlen($plain) . ' bytes is not padded to 64'); }
+              if (strlen($plain) > 2266) { fail('plaintext over 2266 bytes'); }
+              return json_decode($plain, true, 512, JSON_THROW_ON_ERROR);
+          }
+          PHP
+          php -r 'require "/tmp/pw1-open.php";
+            $t = json_decode(file_get_contents("tests/e2e-vectors-v1.json"), true)["seal"][1];
+            if (json_decode(pw1_open($t["key_hex"], $t["envelope"]), true) !== $t["expect"]) { fail("the test opener can not open a vector"); }'
+
+          KEY_A=000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f
+          # Upper case and padded with spaces: the agent takes the key the way
+          # people paste it.
+          printf 'PUSHWARD_API_KEY="hlk_x"\nPUSHWARD_SERVER_NAME="Tower"\nPUSHWARD_E2E_KEY=" %s "\n' "${KEY_A^^}" > /tmp/agent.cfg
+          : > /tmp/agent.log; : > /tmp/agent-syslog
+          EVENT="Unraid Disk 1 error" SUBJECT="Alert [T] - disk 1 failed" IMPORTANCE=alert DESCRIPTION="Array health" \
+            CONTENT="Disk 1 is in an error state" LINK="https://tower.local/Main" TIMESTAMP=1700000000 bash /tmp/plg/PushWard
+          sent="$(cat /tmp/agent.log /tmp/agent-syslog)"
+          case "${sent,,}" in *"$KEY_A"*) echo "FAIL: the encryption key left the box" >&2; exit 1 ;; esac
+          php -r 'require "/tmp/pw1-open.php";
+            $raw = file_get_contents("/tmp/agent.log"); $j = sent();
+            foreach (["Disk 1 is in an error state", "disk 1 failed", "tower.local", "Unraid Disk 1 error"] as $s) {
+              if (str_contains($raw, $s)) { fail("the sealed payload leaks [$s]"); }
+            }
+            if (isset($j["metadata"]["event"])) { fail("metadata.event survived sealing"); }
+            if ($j["metadata"] !== ["importance" => "alert", "server" => "Tower", "timestamp" => "1700000000"]) { fail("readable metadata: " . json_encode($j["metadata"])); }
+            if (($j["collapse_id"] ?? "") !== "unraid-" . substr(sha1("Tower|Unraid Disk 1 error"), 0, 16)) { fail("collapse_id " . ($j["collapse_id"] ?? "-")); }
+            if ($j["level"] !== "time-sensitive" || isset($j["acknowledge"])) { fail("level or an unasked acknowledge changed by sealing"); }
+            $want = ["title" => "Alert [T] - disk 1 failed", "subtitle" => "Unraid \u{b7} Tower", "body" => "Disk 1 is in an error state", "url" => "https://tower.local/Main"];
+            if (opened($argv[1], $j) !== $want) { fail("opened " . json_encode(opened($argv[1], $j))); }
+            echo "sealed notification ok\n";' -- "$KEY_A"
+
+          # The link is sealed only as an absolute http(s) URL: a web UI path gets
+          # the configured base, anything else is left out.
+          link() {  # LINK, expected sealed url or -
+            : > /tmp/agent.log
+            EVENT=e SUBJECT=S IMPORTANCE=normal CONTENT=c LINK="$1" TIMESTAMP=1 bash /tmp/plg/PushWard
+            got="$(php -r 'require "/tmp/pw1-open.php"; echo opened($argv[1], sent())["url"] ?? "-";' -- "$KEY_A")"
+            [ "$got" = "$2" ] || { echo "FAIL: LINK [$1] sealed as '$got', want '$2'" >&2; exit 1; }
+          }
+          link /Main -
+          link "javascript:alert(1)" -
+          link "https://tower.local/Main" "https://tower.local/Main"
+          printf 'PUSHWARD_WEBUI_URL="http://tower.local:8080/"\n' >> /tmp/agent.cfg
+          link /Settings/Notifications "http://tower.local:8080/Settings/Notifications"
+          link Main -
+          link //evil.example/x -
+
+          # Unencrypted, the link takes the same route: a web UI path gets the
+          # base or is left out, since the server refuses a bare path.
+          sed '/^PUSHWARD_E2E_KEY=/d' /tmp/agent.cfg > /tmp/agent-plain.cfg
+          for want in "/Main http://tower.local:8080/Main" "javascript:alert(1) -" "https://x.example/a https://x.example/a"; do
+            : > /tmp/agent.log
+            PUSHWARD_CFG=/tmp/agent-plain.cfg EVENT=e SUBJECT=S IMPORTANCE=normal CONTENT=c LINK="${want% *}" TIMESTAMP=1 bash /tmp/plg/PushWard
+            got="$(php -r 'require "/tmp/pw1-open.php"; $u = sent()["url"] ?? "?"; echo $u === "" ? "-" : $u;')"
+            [ "$got" = "${want#* }" ] || { echo "FAIL: plain LINK [${want% *}] sent as '$got'" >&2; exit 1; }
+          done
+
+          # The live-activity link survives sealing; the plain event name does not.
+          : > /tmp/agent.log
+          EVENT="Unraid Parity-Check" SUBJECT=N IMPORTANCE=warning CONTENT=c LINK=x TIMESTAMP=1 bash /tmp/plg/PushWard
+          php -r 'require "/tmp/pw1-open.php"; $j = sent();
+            if (($j["activity_slug"] ?? "") !== "tower-array") { fail("sealing dropped the activity link"); }
+            if (stripos(json_encode($j), "parity") !== false) { fail("the event name is readable in a sealed payload"); }'
+
+          # Long text is cut to fit one envelope, the body first and never through
+          # a character: 3-byte CJK, 4-byte emoji, U+2028 and characters JSON
+          # escapes to 2 or 6 bytes all have to be counted right. Only a link too
+          # long to leave room for any text is dropped instead.
+          fit() {  # SUBJECT, CONTENT, LINK, title characters expected ("cut": fewer than 256), link kept (yes/no)
+            : > /tmp/agent.log
+            EVENT=e SUBJECT="$1" IMPORTANCE=alert CONTENT="$2" LINK="$3" TIMESTAMP=1 bash /tmp/plg/PushWard
+            php -r 'require "/tmp/pw1-open.php"; $m = opened($argv[1], sent());
+              [, , $subject, $content, $link, $titleLen, $linkKept] = $argv;
+              // What the agent saw: a byte that is not UTF-8 arrives as U+FFFD.
+              $clean = fn($s) => json_decode(json_encode($s, JSON_INVALID_UTF8_SUBSTITUTE));
+              if ($m["body"] === "" || !str_starts_with($clean($content), $m["body"])) { fail("the body is not a prefix of the content"); }
+              if ($m["title"] === "" || !str_starts_with($clean($subject), $m["title"])) { fail("the title is not a prefix of the subject"); }
+              $got = mb_strlen($m["title"]);
+              if ($titleLen === "cut" ? $got >= 256 : $got !== (int) $titleLen) { fail("title of $got characters, want $titleLen"); }
+              if (($m["url"] ?? null) !== ($linkKept === "yes" ? $link : null)) { fail("link kept: " . ($m["url"] ?? "none")); }' \
+              -- "$KEY_A" "$1" "$2" "$3" "$4" "$5"
+          }
+          L=https://tower.local/Main
+          fit "$(printf 'T%.0s' {1..300})" "$(php -r 'echo str_repeat("\u{4e2d}", 3000);')" "$L" 256 yes
+          fit "Escapes" "$(php -r 'echo str_repeat("a\x01\"\\\n\u{1F525}\u{2028}/", 600);')" "$L" 7 yes
+          fit "$(php -r 'echo str_repeat("\u{1F525}", 300);')" "$(php -r 'echo str_repeat("\x01", 3000);')" "$L" 256 yes
+          fit "$(php -r 'echo str_repeat("\x01", 300);')" "body" "$L/$(printf 'p%.0s' {1..1500})" cut yes
+          fit "Long link" "body" "$L/$(printf 'p%.0s' {1..3000})" 9 no
+          fit "Bad byte" $'\xff then text' "$L" 8 yes
+
+          # Without AES-256-GCM in PHP the alert still goes out content-free, and
+          # the warning openssl_encrypt() prints must not land in the payload,
+          # whatever the box's display_errors says. A copy of the agent asks for
+          # a cipher no PHP has, run by a php that prints every warning to stdout.
+          sed 's/"aes-256-gcm"/"aes-256-none"/' /tmp/plg/PushWard > /tmp/agent-nocipher
+          ! cmp -s /tmp/plg/PushWard /tmp/agent-nocipher || { echo "::error::the cipher name was not found in the agent"; exit 1; }
+          mkdir -p /tmp/stub-php
+          printf '#!/bin/sh\nexec %s -d display_errors=1 -d error_reporting=-1 "$@"\n' "$(command -v php)" > /tmp/stub-php/php
+          chmod +x /tmp/stub-php/php
+          : > /tmp/agent.log; : > /tmp/agent-syslog
+          PATH="/tmp/stub-php:$PATH" EVENT=e SUBJECT="Alert [T] - secret subject" IMPORTANCE=alert CONTENT="secret content" \
+            LINK=x TIMESTAMP=1 bash /tmp/agent-nocipher
+          php -r 'require "/tmp/pw1-open.php"; $j = sent();
+            if (($j["body"] ?? "") !== "Encryption unavailable on this server, check the PushWard plugin settings" || isset($j["encrypted"])) { fail("no AES-256-GCM: " . json_encode($j)); }
+            if (str_contains(file_get_contents("/tmp/agent.log"), "secret")) { fail("no AES-256-GCM leaked the alert"); }'
+          case "$(cat /tmp/agent-syslog)" in *"encryption failed"*) ;; *) echo "FAIL: no log line for the missing cipher" >&2; exit 1 ;; esac
+
+          # A key that can not be used sends a content-free alert in the clear:
+          # the phone still hears about it, the details stay on the box, and the
+          # log names the problem without the key.
+          for bad in "hlk_notakey" "0001" "zz${KEY_A:2}"; do
+            printf 'PUSHWARD_API_KEY="hlk_x"\nPUSHWARD_SERVER_NAME="Tower"\nPUSHWARD_E2E_KEY="%s"\n' "$bad" > /tmp/agent.cfg
+            : > /tmp/agent.log; : > /tmp/agent-syslog
+            EVENT="Unraid Parity-Check" SUBJECT="Alert [T] - secret subject" IMPORTANCE=alert CONTENT="secret content" \
+              LINK="https://tower.local/Main" TIMESTAMP=1 bash /tmp/plg/PushWard
+            php -r 'require "/tmp/pw1-open.php"; $j = sent();
+              $want = ["title" => "Unraid alert on Tower", "body" => "Encryption key invalid, check the PushWard plugin settings", "level" => "time-sensitive"];
+              if (array_intersect_key($j, $want) !== $want) { fail("not the content-free alert: " . json_encode($j)); }
+              foreach (["subtitle", "url", "encrypted", "activity_slug"] as $k) { if (isset($j[$k])) { fail("content-free alert carries $k"); } }
+              if (isset($j["metadata"]["event"]) || str_contains(file_get_contents("/tmp/agent.log"), "secret")) { fail("content-free alert leaks the event"); }'
+            syslog="$(cat /tmp/agent-syslog)"
+            case "$syslog" in *"encryption key"*"invalid"*) ;; *) echo "FAIL: no log line for the bad key [$bad]" >&2; exit 1 ;; esac
+            case "$syslog" in *"$bad"*) echo "FAIL: the log shows the key" >&2; exit 1 ;; esac
+          done
+
+          # Repeat until acknowledged: only when switched on, only for what
+          # arrived as an alert, with the bounds clamped to the server's.
+          # Each alert carries two tags: the server, and the event hashed with it.
+          printf 'PUSHWARD_API_KEY="hlk_x"\nPUSHWARD_SERVER_NAME="Tower"\nPUSHWARD_ACK="1"\n' > /tmp/agent.cfg
+          etag() { printf 'unraid-%s' "$(printf '%s|%s' "$1" "${2:-e}" | sha1sum | cut -c1-16)"; }
+          ack() {  # importance, subject, expected "repeat expire tags" or -
+            : > /tmp/agent.log
+            EVENT="${EVENT-e}" SUBJECT="$2" IMPORTANCE="$1" DESCRIPTION=d LINK=x TIMESTAMP=1 bash /tmp/plg/PushWard
+            got="$(php -r 'require "/tmp/pw1-open.php"; $j = sent(); $a = $j["acknowledge"] ?? null;
+              echo $a === null ? (isset($j["tags"]) ? "tags-without-acknowledge" : "-")
+                : $a["repeat_seconds"] . " " . $a["expire_seconds"] . " " . implode(",", $j["tags"] ?? []);')"
+            [ "$got" = "$3" ] || { echo "FAIL: acknowledge for [$1 / $2] -> '$got', want '$3'" >&2; exit 1; }
+          }
+          ack alert   "Alert [T] - disk"   "300 3600 unraid-tower,$(etag Tower)"
+          ack warning "Warning [T] - smart" -
+          ack normal  "Notice [T] - update" -
+          ack normal  "Alert [T] - raised"  "300 3600 unraid-tower,$(etag Tower)"
+          ack warning "Alert [T] - stays"   -
+          EVENT="" ack alert "Alert [T] - no event" "300 3600 unraid-tower"
+          printf 'PUSHWARD_ACK_REPEAT="5"\nPUSHWARD_ACK_EXPIRE="99999"\n' >> /tmp/agent.cfg
+          ack alert "Alert [T] - disk" "30 10800 unraid-tower,$(etag Tower)"
+          printf 'PUSHWARD_ACK_REPEAT="soon"\nPUSHWARD_ACK_EXPIRE=""\nPUSHWARD_SERVER_NAME="My Tower #2"\n' >> /tmp/agent.cfg
+          ack alert "Alert [T] - disk" "300 3600 unraid-my-tower-2,$(etag 'My Tower #2')"
+          long="$(printf 'x%.0s' {1..100})"
+          printf 'PUSHWARD_SERVER_NAME="%s"\n' "$long" >> /tmp/agent.cfg
+          ack alert "Alert [T] - disk" "300 3600 unraid-$(printf 'x%.0s' {1..57}),$(etag "$long")"
+          printf 'PUSHWARD_SERVER_NAME="!!!"\n' >> /tmp/agent.cfg
+          ack alert "Alert [T] - disk" "300 3600 unraid-$(printf '!!!' | sha1sum | cut -c1-12),$(etag '!!!')"
+          printf 'PUSHWARD_ACK="0"\n' >> /tmp/agent.cfg
+          ack alert "Alert [T] - disk" -
+          # Sealing leaves the acknowledge readable: the server has to run it.
+          printf 'PUSHWARD_API_KEY="hlk_x"\nPUSHWARD_SERVER_NAME="Tower"\nPUSHWARD_ACK="1"\nPUSHWARD_E2E_KEY="%s"\n' "$KEY_A" > /tmp/agent.cfg
+          ack alert "Alert [T] - disk" "300 3600 unraid-tower,$(etag Tower)"
+          php -r 'require "/tmp/pw1-open.php"; opened($argv[1], sent());' -- "$KEY_A"
+
+          # The recovery notice for an event stops that event's repeats first,
+          # or a late repeat would cover it on the Lock Screen (both carry the
+          # same collapse id). Only with repeats on, never for an alert, and a
+          # failed cancel never holds the notice back.
+          printf 'PUSHWARD_API_KEY="hlk_x"\nPUSHWARD_SERVER_NAME="Tower"\nPUSHWARD_ACK="1"\n' > /tmp/agent.cfg
+          calls() {  # cancel code, importance, expected calls (comma separated)
+            : > /tmp/agent.log; : > /tmp/agent-calls; : > /tmp/agent-syslog
+            STUB_CANCEL_CODE="$1" EVENT="Unraid Disk 1 error" SUBJECT="Notice [T] - back to normal" IMPORTANCE="$2" \
+              DESCRIPTION=d LINK=x TIMESTAMP=1 bash /tmp/plg/PushWard
+            got="$(sed -e "s/^cancel {\"tag\":\"$(etag Tower 'Unraid Disk 1 error')\"}\$/cancel/" /tmp/agent-calls | paste -sd, -)"
+            [ "$got" = "$3" ] || { echo "FAIL: calls for [$1 / $2] -> '$got', want '$3'" >&2; exit 1; }
+          }
+          calls 200 normal  cancel,notify
+          calls 200 warning cancel,notify
+          calls 200 alert   notify
+          calls 500 normal  cancel,notify
+          case "$(cat /tmp/agent-syslog)" in *"could not stop"*) ;; *) echo "FAIL: a failed cancel was not logged" >&2; exit 1 ;; esac
+          calls 000 normal  cancel,notify
+          : > /tmp/agent-calls
+          EVENT="" SUBJECT="Notice [T] - no event" IMPORTANCE=normal DESCRIPTION=d LINK=x TIMESTAMP=1 bash /tmp/plg/PushWard
+          [ "$(cat /tmp/agent-calls)" = "notify" ] || { echo "FAIL: canceled without an event" >&2; exit 1; }
+          printf 'PUSHWARD_ACK="0"\n' >> /tmp/agent.cfg
+          calls 200 normal notify
+
+          # A refused acknowledge must not lose the alert: on the refusals that
+          # create nothing, resend once without acknowledge and tags. Never after
+          # an auth failure, a rate limit or a 5xx, which would only duplicate
+          # the alert or fail again.
+          printf 'PUSHWARD_API_KEY="hlk_x"\nPUSHWARD_SERVER_NAME="Tower"\nPUSHWARD_ACK="1"\n' > /tmp/agent.cfg
+          fallback() {  # status, problem code, expected sends
+            : > /tmp/agent.log
+            STUB_CODES="$1 200" STUB_BODY="{\"status\":$1,\"code\":\"$2\"}" EVENT=e SUBJECT=S IMPORTANCE=alert DESCRIPTION=d \
+              LINK=x TIMESTAMP=1 bash /tmp/plg/PushWard
+            sends="$(wc -l < /tmp/agent.log)"
+            [ "$sends" = "$3" ] || { echo "FAIL: HTTP $1 [$2] -> $sends sends, want $3" >&2; exit 1; }
+            php -r 'require "/tmp/pw1-open.php"; $first = sent();
+              if (!isset($first["acknowledge"], $first["tags"])) { fail("the first send carried no acknowledge"); }
+              if ($argv[1] === "2") {
+                unset($first["acknowledge"], $first["tags"]);
+                if (sent(1) !== $first) { fail("the resend is not the alert without acknowledge: " . json_encode(sent(1))); }
+              }' -- "$3"
+          }
+          fallback 409 notification_receipt.limit_exceeded 2
+          fallback 422 notification_receipt.disabled 2
+          fallback 422 notification.answer_url_unavailable 2
+          fallback 422 notification.encrypted_too_large 2
+          fallback 400 notification.invalid 2
+          fallback 422 "" 2
+          fallback 409 activity.limit_exceeded 1
+          fallback 401 auth.invalid_key 1
+          fallback 403 auth.forbidden 1
+          fallback 429 rate_limit.exceeded 1
+          fallback 500 "" 1
+          fallback 000 "" 1
+          # A stale slug and the acknowledge are separate refusals: a 422 naming
+          # the slug drops only the slug, and the acknowledge goes out with it.
+          : > /tmp/agent.log
+          STUB_CODES="422 200" STUB_BODY='{"code":"notification.activity_not_found"}' EVENT="Unraid Parity-Check" \
+            SUBJECT="Alert [T] - parity" IMPORTANCE=alert DESCRIPTION=d LINK=x TIMESTAMP=1 bash /tmp/plg/PushWard
+          php -r 'require "/tmp/pw1-open.php";
+            if (count(file("/tmp/agent.log")) !== 2) { fail("no resend after a stale slug"); }
+            $a = sent(0); $b = sent(1);
+            if (($a["activity_slug"] ?? "") !== "tower-array" || isset($b["activity_slug"]) || !isset($b["acknowledge"])) { fail("stale slug resend: " . json_encode($b)); }'
+          echo "encryption and acknowledge ok"
 
       - name: Lint PHP and the page JS
         run: |

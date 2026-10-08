@@ -25,6 +25,7 @@ function pw_options($cfg, $key, $default, array $opts = ['true' => 'Enabled', 'f
     if (!isset($opts[$cur])) { $cur = $default; }
     $out = '';
     foreach ($opts as $v => $label) {
+        $v = (string) $v;   // PHP turns a '1'/'0' key into an int
         $sel = $v === $cur ? ' selected' : '';
         $out .= "<option value='$v'$sel>$label</option>";
     }
@@ -58,6 +59,25 @@ function pw_notify_agent_levels() {
         if (((int) ($ini['notify'][$k] ?? 0)) & $agentMethod) { $out[] = $lbl; }
     }
     return $out;
+}
+
+// The stored encryption key as the agent reads it, reduced to what the page may
+// show: the Key ID the PushWard app lists next to the same key, or why the agent
+// will send content-free alerts instead. Never the key itself. null when unset.
+function pw_e2e_status($text) {
+    $hex = preg_replace('/[ \t\n\r\f\x0B]+/', '', (string) $text);
+    if ($hex === '') { return null; }
+    if (str_starts_with($hex, 'hlk_') || str_starts_with($hex, 'hla_')) {
+        return ['bad', 'Key invalid', 'that is an API key; alerts go out without details'];
+    }
+    if (!preg_match('/^[0-9a-fA-F]{64}\z/', $hex)) {
+        return ['bad', 'Key invalid', 'alerts go out without details'];
+    }
+    if (!function_exists('hash_hkdf') || !function_exists('openssl_encrypt')
+        || !in_array('aes-256-gcm', openssl_get_cipher_methods(), true)) {
+        return ['bad', 'Unavailable', 'PHP lacks AES-256-GCM; alerts go out without details'];
+    }
+    return ['ok', 'Key ID ' . bin2hex(hash_hkdf('sha256', hex2bin($hex), 4, 'pushward/e2e/v1/kid')), 'should match the app'];
 }
 
 // One derivation of the monitor's situation, so the status chip and the log-panel
@@ -95,6 +115,7 @@ function pw_log_note($state) {
     return $t[$state];
 }
 $configured = !empty($cfg['PUSHWARD_API_KEY']);
+$e2e = pw_e2e_status($cfg['PUSHWARD_E2E_KEY'] ?? '');
 $activities = pw_enabled($cfg, 'PUSHWARD_ACTIVITIES_ENABLED');
 // Widgets read with the daemon's polarity, not pw_enabled's: watchdog.sh and the
 // daemon both start only on the literal "true".
@@ -152,6 +173,9 @@ if ($configured) {
         $chips[] = ['label' => 'Notifications', 'state' => $allLevels ? 'ok' : 'warn',
             'value' => $allLevels ? 'All levels' : implode(', ', $notifyLevels),
             'sub' => $allLevels ? '' : 'other levels are not forwarded'];
+    }
+    if ($e2e) {
+        $chips[] = ['label' => 'Encryption', 'state' => $e2e[0], 'value' => $e2e[1], 'sub' => $e2e[2]];
     }
 }
 function pw_chip_icon($cls) {
@@ -242,6 +266,18 @@ Server display name:
 Alert notification level:
 : <select name="PUSHWARD_ALERT_LEVEL"><?= pw_options($cfg, 'PUSHWARD_ALERT_LEVEL', 'time-sensitive', ['active' => 'Normal', 'time-sensitive' => 'Time Sensitive', 'critical' => 'Critical']) ?></select>
 
+Repeat alerts until acknowledged:
+: <select name="PUSHWARD_ACK"><?= pw_options($cfg, 'PUSHWARD_ACK', '0', ['1' => 'Enabled', '0' => 'Disabled']) ?></select>
+
+Repeat every (seconds):
+: <input type="number" name="PUSHWARD_ACK_REPEAT" min="30" max="3600" value="<?= pw_val($cfg,'PUSHWARD_ACK_REPEAT','300') ?>">
+
+Stop repeating after (seconds):
+: <input type="number" name="PUSHWARD_ACK_EXPIRE" min="60" max="10800" value="<?= pw_val($cfg,'PUSHWARD_ACK_EXPIRE','3600') ?>">
+
+End-to-end encryption key:
+: <input type="password" id="pushward_e2e_key" name="PUSHWARD_E2E_KEY" maxlength="200" value="" autocomplete="off" placeholder="<?= $e2e ? 'leave blank to keep current key' : 'optional, 64 hex characters from the app' ?>"><?PHP if ($e2e): ?> <label><input type="checkbox" id="pushward_e2e_remove"> Remove key</label><?PHP endif; ?>
+
 Live Activities:
 : <select name="PUSHWARD_ACTIVITIES_ENABLED"><?= pw_options($cfg,'PUSHWARD_ACTIVITIES_ENABLED','true') ?></select>
 
@@ -287,7 +323,26 @@ Widget refresh interval (seconds):
 // POST over the on-disk cfg). A typed value overwrites as normal.
 function pwKeepKey() {
   var k = document.getElementById('pushward_api_key');
+  var e = document.getElementById('pushward_e2e_key');
+  var rm = document.getElementById('pushward_e2e_remove');
+  var removing = !!(rm && rm.checked);
+  // Validate before touching any field: returning false after a name is gone
+  // would make the next Apply drop a key typed in the meantime.
+  if (e && !removing) {
+    e.value = e.value.replace(/\s+/g, '');
+    if (e.value !== '' && !/^[0-9a-fA-F]{64}$/.test(e.value)) {
+      alert('The encryption key is the 64 hexadecimal characters the PushWard app shows under Settings > End-to-End Encryption, not an API key.');
+      return false;
+    }
+  }
   if (k && k.value === '') k.removeAttribute('name');
+  // The encryption key works the same way, except that "Remove key" posts it
+  // empty, which clears it. The box itself has no name and is never saved.
+  if (e && removing) {
+    e.value = '';
+  } else if (e && e.value === '') {
+    e.removeAttribute('name');
+  }
   return true;
 }
 </script>
@@ -317,6 +372,10 @@ function pwKeepKey() {
 <div class="pw-callout">
   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><line x1="12" y1="11" x2="12" y2="16"/><line x1="12" y1="8" x2="12" y2="8.5"/></svg>
   <p><strong>Notifications:</strong> Unraid calls the agent for any importance with the <strong>Agent</strong> method enabled under Settings &rarr; Notifications (Warning and Alert by default). <strong>Live Activities:</strong> a background monitor watches parity checks, appdata backups, the mover, VM backups and the UPS, and pushes progress to your phone. See the <a href="/Settings/pushward-activities">Activities</a> tab.</p>
+</div>
+<div class="pw-callout">
+  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg>
+  <p><strong>Encryption:</strong> create a key in the PushWard app (1.17 or later) under Settings &rarr; End-to-End Encryption and paste it above; the Key ID in the status cards should match the app. The title, subtitle, body and link of each notification are then encrypted on this server before they leave it. PushWard still reads the level, the server name, the timestamp and the importance, the name of the Live Activity a notification links to (such as tower-array) and the repeat tags, which carry the server name. Live Activities themselves (parity, mover, backups, UPS) are not encrypted. <strong>Repeat alerts:</strong> an Unraid Alert keeps coming back at the chosen interval until you tap Acknowledge on a device, or until it stops after the set time. Warnings and info never repeat.</p>
 </div>
 <?PHP if ($configured): ?>
 <div class="pw-logwrap">

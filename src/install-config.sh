@@ -34,5 +34,12 @@ ensure PUSHWARD_WEBUI_URL '""'
 # uninvited entries in someone's iOS widget picker is not ours to add.
 ensure PUSHWARD_WIDGETS_ENABLED '"false"'
 ensure PUSHWARD_WIDGET_INTERVAL '"300"'
+# Blank means notifications go out unencrypted, as they always have.
+ensure PUSHWARD_E2E_KEY '""'
+# Repeat-until-acknowledged is opt-in: it keeps pinging the phone for every
+# alert until someone answers, which nobody asked for on upgrade.
+ensure PUSHWARD_ACK '"0"'
+ensure PUSHWARD_ACK_REPEAT '"300"'
+ensure PUSHWARD_ACK_EXPIRE '"3600"'
 chmod 600 "$CFG_FILE"
 echo "PushWard config ready at $CFG_FILE"
