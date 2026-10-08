@@ -32,6 +32,9 @@ Open Settings > PushWard (in the User Utilities row) and, on the Settings tab, f
 | PushWard API key | An `hlk_...` key (permissions below) |
 | Server display name | Shown under notifications and used to name activities, e.g. "Tower" |
 | Alert notification level | Which PushWard level an Unraid Alert becomes: Normal, Time Sensitive (default) or Critical |
+| Repeat alerts until acknowledged | Off by default. When on, an Unraid Alert [repeats](#repeat-until-acknowledged) until you acknowledge it |
+| Repeat every / Stop repeating after | Seconds between repeats (default 300, 30-3600) and how long to keep going (default 3600, 60-10800) |
+| End-to-end encryption key | Optional. A key from the PushWard app that turns on [end-to-end encryption](#end-to-end-encryption) |
 | Live Activities | Master switch for progress activities |
 | Track parity / appdata backup / mover / VM backup / UPS | Per-source toggles |
 | Poll interval | How often the monitor checks state (default 15s) |
@@ -61,6 +64,25 @@ The agent lives at `/boot/config/plugins/dynamix/notifications/agents/PushWard`.
 Unraid has three importances. An `ALERT` becomes whatever "Alert notification level" is set to, Time Sensitive out of the box; a `WARNING` becomes a Normal push; anything else stays passive. A subject starting `Alert [` or `Warning [` raises the level to match whatever importance it arrived with, and never lowers it - Unraid sends a parity check that finished *with* errors as `Notice [...]` at Warning importance. Critical is the level that breaks through Do Not Disturb and the silent switch, so it is opt-in, and it needs the critical-alert permission granted to the PushWard app.
 
 Repeats of the same event replace the previous banner rather than stacking, keyed on the server name and the event, so a SMART warning that repeats every hour leaves one banner. The app's notification list still holds every one of them. A notification about a job the monitor is already tracking carries a link to that Live Activity.
+
+#### Repeat until acknowledged
+
+Off by default. Switch on "Repeat alerts until acknowledged" and every notification that arrives as an Unraid Alert comes back every 300 seconds (or whatever you set) until you tap Acknowledge on one of your devices, or until the stop time passes, an hour by default. Warnings and info never repeat. "Send test notification" sends an Alert, so it is an easy way to try it.
+
+Each repeating alert is tagged `unraid-<server name>`, lowercased with dashes, so `pushward receipt cancel --tag unraid-tower` from the [PushWard CLI](https://github.com/mac-lucky/pushward-cli) stops them all; a tag only reaches what the same API key sent. It also gets a second tag hashed from the server and the event, and when a notification for that event arrives that is not an alert, like Unraid's "returned to normal", the plugin cancels the alert's repeats before sending it, so a late repeat cannot cover the good news. An account holds at most 25 repeating alerts at once. Past that, or when PushWard turns acknowledged alerts off for a while, the plugin sends the alert once as an ordinary notification rather than lose it.
+
+#### End-to-end encryption
+
+With a key set, the agent encrypts the title, subtitle, body and link of every notification on the box before it is sent. PushWard stores and forwards an envelope it cannot open, and your devices decrypt it with the same key.
+
+1. In the PushWard app (1.17 or later), open Settings > End-to-End Encryption, create a key and copy it.
+2. Paste it into "End-to-end encryption key" and click Apply. The status cards show its Key ID, which should match the one in the app.
+
+The page never shows the stored key: leaving the field empty keeps it, pasting another one replaces it, and "Remove key" turns encryption off. An `hlk_` API key pasted there is refused.
+
+PushWard still reads the level, the server name, the timestamp and the importance, the name of the Live Activity a notification links to (`tower-array`, `tower-backup`, `tower-vmbackup`), and the repeat settings and tags when those are on (`unraid-tower` names the server). The event name is replaced by a hash, so repeats of one event still replace each other's banner. A link is encrypted only as a full `http://` or `https://` address: a web UI path gets the "Unraid web UI URL" in front of it, or is left out when that is unknown. The envelope fits about 2.2 KB of text, so a long message is shortened, the body first. Live Activities and widgets are not encrypted at all, so the jobs they track are visible to PushWard either way.
+
+If the key is not valid, or PHP on the box has no AES-256-GCM, notifications still go out but without the details ("Unraid alert on Tower", with a body saying which of the two it is), the syslog says why, and the Encryption card on the Settings tab turns red. An API key that belongs to an organization cannot send encrypted notifications; PushWard refuses them and the syslog says so. A device without the key, or with an app older than 1.17, shows "Encrypted notification" in place of the text.
 
 ### Live Activities
 
