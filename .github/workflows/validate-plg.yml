@@ -229,8 +229,9 @@ jobs:
           mkdir -p /tmp/stub
           # The stub logs each notification payload, answers with the next
           # status from STUB_CODES (the last one repeats; STUB_CODE for a single
-          # one) and writes STUB_BODY to the -o file on a non-2xx, the way the
-          # server explains a refusal. A receipt cancel answers STUB_CANCEL_CODE
+          # one) and on a non-2xx writes the matching body from STUB_BODIES
+          # (STUB_BODY for one) to the -o file, the way the server explains a
+          # refusal. A receipt cancel answers STUB_CANCEL_CODE
           # (000 fails like a dead network) and is kept apart from the payload
           # log; /tmp/agent-calls records the order of both.
           cat > /tmp/stub/curl <<'STUB'
@@ -253,9 +254,11 @@ jobs:
           printf 'notify\n' >> /tmp/agent-calls
           printf '%s\n' "$data" >> "$STUB_LOG"
           read -r -a codes <<< "${STUB_CODES:-${STUB_CODE:-200}}"
+          read -r -a bodies <<< "${STUB_BODIES:-${STUB_BODY:-}}"
           n=$(wc -l < "$STUB_LOG")
           code="${codes[n-1]:-${codes[-1]}}"
-          case "$code" in 2*) printf '{}' ;; *) printf '%s' "${STUB_BODY:-}" ;; esac > "$out"
+          body=""; [ "${#bodies[@]}" -eq 0 ] || body="${bodies[n-1]:-${bodies[-1]}}"
+          case "$code" in 2*) printf '{}' ;; *) printf '%s' "$body" ;; esac > "$out"
           printf '%s' "$code"
           STUB
           chmod +x /tmp/stub/curl
@@ -288,6 +291,16 @@ jobs:
           # The repeating SMART subject carries a ticking attribute value; the key
           # must not move with it, or the banners stack again.
           check "Unraid Disk 1 SMART"  "Warning [T] - smart 199" warning active - tower-unraid-disk-1-smart
+          # "Unraid Status" is what notify files a notification without -e under
+          # (User Scripts, many plugins): unrelated ones, so the subject joins in,
+          # and only through the hash. A slug keeps a-z and 0-9, so subjects in
+          # another script, or that differ only in accents or punctuation, would
+          # collide in it.
+          gid() { printf 'tower-unraid-status-%s' "$(printf '%s\0%s' Tower "Unraid Status|$1" | sha1sum | cut -c1-32)"; }
+          for subject in "Notice [T] - backup done" "Notice [T] - sync done" "Backup: done!" "Backup - done?" \
+            $'\xe5\xa4\x87\xe4\xbb\xbd\xe5\xae\x8c\xe6\x88\x90' $'\xe5\x90\x8c\xe6\xad\xa5\xe5\xa4\xb1\xe8\xb4\xa5' $'caf\xc3\xa9' $'caf\xc3\xa8'; do
+            check "Unraid Status" "$subject" normal passive - "$(gid "$subject")"
+          done
           # No event, no key: a blank collapse_id would make every unlabelled
           # notification replace every other one.
           check ""                     "Notice [T] - update" normal  passive        - -
@@ -434,7 +447,10 @@ jobs:
             }
             if (isset($j["metadata"]["event"])) { fail("metadata.event survived sealing"); }
             if ($j["metadata"] !== ["importance" => "alert", "server" => "Tower", "timestamp" => "1700000000"]) { fail("readable metadata: " . json_encode($j["metadata"])); }
-            if (($j["collapse_id"] ?? "") !== "unraid-" . substr(sha1("Tower|Unraid Disk 1 error"), 0, 16)) { fail("collapse_id " . ($j["collapse_id"] ?? "-")); }
+            // With a key the event hash is an HMAC under a key derived from it,
+            // so it can not be matched against a list of likely event names.
+            $tagKey = hash_hkdf("sha256", hex2bin($argv[1]), 32, "pushward/unraid/v1/event-tag");
+            if (($j["collapse_id"] ?? "") !== "unraid-" . substr(hash_hmac("sha256", "Tower|Unraid Disk 1 error", $tagKey), 0, 16)) { fail("collapse_id " . ($j["collapse_id"] ?? "-")); }
             if ($j["level"] !== "time-sensitive" || isset($j["acknowledge"])) { fail("level or an unasked acknowledge changed by sealing"); }
             $want = ["title" => "Alert [T] - disk 1 failed", "subtitle" => "Unraid \u{b7} Tower", "body" => "Disk 1 is in an error state", "url" => "https://tower.local/Main"];
             if (opened($argv[1], $j) !== $want) { fail("opened " . json_encode(opened($argv[1], $j))); }
@@ -515,6 +531,15 @@ jobs:
             if (($j["body"] ?? "") !== "Encryption unavailable on this server, check the PushWard plugin settings" || isset($j["encrypted"])) { fail("no AES-256-GCM: " . json_encode($j)); }
             if (str_contains(file_get_contents("/tmp/agent.log"), "secret")) { fail("no AES-256-GCM leaked the alert"); }'
           case "$(cat /tmp/agent-syslog)" in *"encryption failed"*) ;; *) echo "FAIL: no log line for the missing cipher" >&2; exit 1 ;; esac
+          # Anything else on stdout ahead of the builder (a php.ini prepend, a
+          # noisy extension) garbles the event tag line: logged, nothing posted.
+          mkdir -p /tmp/stub-noisy
+          printf '#!/bin/sh\necho "Deprecated: something noisy"\nexec %s "$@"\n' "$(command -v php)" > /tmp/stub-noisy/php
+          chmod +x /tmp/stub-noisy/php
+          : > /tmp/agent.log; : > /tmp/agent-syslog
+          PATH="/tmp/stub-noisy:$PATH" EVENT=e SUBJECT=S IMPORTANCE=alert CONTENT=c LINK=x TIMESTAMP=1 bash /tmp/plg/PushWard
+          [ ! -s /tmp/agent.log ] || { echo "FAIL: posted a garbled build: $(cat /tmp/agent.log)" >&2; exit 1; }
+          case "$(cat /tmp/agent-syslog)" in *"could not be built"*) ;; *) echo "FAIL: a garbled build was not logged" >&2; exit 1 ;; esac
 
           # A key that can not be used sends a content-free alert in the clear:
           # the phone still hears about it, the details stay on the box, and the
@@ -566,8 +591,15 @@ jobs:
           ack alert "Alert [T] - disk" -
           # Sealing leaves the acknowledge readable: the server has to run it.
           printf 'PUSHWARD_API_KEY="hlk_x"\nPUSHWARD_SERVER_NAME="Tower"\nPUSHWARD_ACK="1"\nPUSHWARD_E2E_KEY="%s"\n' "$KEY_A" > /tmp/agent.cfg
-          ack alert "Alert [T] - disk" "300 3600 unraid-tower,$(etag Tower)"
+          hetag() {  # server, event, key hex -> the event tag with a key set
+            php -r 'echo "unraid-", substr(hash_hmac("sha256", $argv[1] . "|" . $argv[2],
+              hash_hkdf("sha256", hex2bin($argv[3]), 32, "pushward/unraid/v1/event-tag")), 0, 16);' -- "$@"
+          }
+          ack alert "Alert [T] - disk" "300 3600 unraid-tower,$(hetag Tower e "$KEY_A")"
           php -r 'require "/tmp/pw1-open.php"; opened($argv[1], sent());' -- "$KEY_A"
+          printf 'PUSHWARD_API_KEY="hlk_x"\nPUSHWARD_SERVER_NAME="Tower"\nPUSHWARD_ACK="1"\n' > /tmp/agent.cfg
+          EVENT="Unraid Status" ack alert "Alert [T] - script failed" "300 3600 unraid-tower,$(etag Tower 'Unraid Status|Alert [T] - script failed')"
+          EVENT="Unraid Status" ack alert "Alert [T] - other script" "300 3600 unraid-tower,$(etag Tower 'Unraid Status|Alert [T] - other script')"
 
           # The recovery notice for an event stops that event's repeats first,
           # or a late repeat would cover it on the Lock Screen (both carry the
@@ -590,8 +622,32 @@ jobs:
           : > /tmp/agent-calls
           EVENT="" SUBJECT="Notice [T] - no event" IMPORTANCE=normal DESCRIPTION=d LINK=x TIMESTAMP=1 bash /tmp/plg/PushWard
           [ "$(cat /tmp/agent-calls)" = "notify" ] || { echo "FAIL: canceled without an event" >&2; exit 1; }
+          # A generic notice belongs to no alert, so it cancels nothing.
+          : > /tmp/agent-calls
+          EVENT="Unraid Status" SUBJECT="Notice [T] - script done" IMPORTANCE=normal DESCRIPTION=d LINK=x TIMESTAMP=1 bash /tmp/plg/PushWard
+          [ "$(cat /tmp/agent-calls)" = "notify" ] || { echo "FAIL: a generic notice canceled repeats" >&2; exit 1; }
           printf 'PUSHWARD_ACK="0"\n' >> /tmp/agent.cfg
           calls 200 normal notify
+
+          # With a key, the alert and its recovery notice still agree on the tag:
+          # the alert carries it and uses it as collapse id, the notice cancels it,
+          # and also the plain sha1 tag an alert from 2026.10.08 may still carry.
+          printf 'PUSHWARD_API_KEY="hlk_x"\nPUSHWARD_SERVER_NAME="Tower"\nPUSHWARD_ACK="1"\nPUSHWARD_E2E_KEY="%s"\n' "$KEY_A" > /tmp/agent.cfg
+          : > /tmp/agent.log; : > /tmp/agent-calls
+          EVENT="Unraid Disk 1 error" SUBJECT="Alert [T] - disk" IMPORTANCE=alert CONTENT=c LINK=x TIMESTAMP=1 bash /tmp/plg/PushWard
+          EVENT="Unraid Disk 1 error" SUBJECT="Notice [T] - disk back" IMPORTANCE=normal CONTENT=c LINK=x TIMESTAMP=2 bash /tmp/plg/PushWard
+          php -r 'require "/tmp/pw1-open.php"; $a = sent(0); $b = sent(1);
+            $tag = $argv[1];
+            if (($a["tags"][1] ?? "") !== $tag || $a["collapse_id"] !== $tag || $b["collapse_id"] !== $tag) { fail("alert and notice disagree on the event tag: " . json_encode([$a["tags"] ?? null, $a["collapse_id"], $b["collapse_id"]])); }
+            $legacy = "unraid-" . substr(sha1("Tower|Unraid Disk 1 error"), 0, 16);
+            if (file("/tmp/agent-calls", FILE_IGNORE_NEW_LINES) !== ["notify", "cancel {\"tag\":\"$tag\"}", "cancel {\"tag\":\"$legacy\"}", "notify"]) { fail("calls: " . file_get_contents("/tmp/agent-calls")); }' \
+            -- "$(hetag Tower 'Unraid Disk 1 error' "$KEY_A")"
+          # Both cancels are tried when the first fails, and the notice still goes out.
+          : > /tmp/agent.log; : > /tmp/agent-calls; : > /tmp/agent-syslog
+          STUB_CANCEL_CODE=000 EVENT="Unraid Disk 1 error" SUBJECT="Notice [T] - disk back" IMPORTANCE=normal CONTENT=c LINK=x \
+            TIMESTAMP=2 bash /tmp/plg/PushWard
+          [ "$(cut -c1-6 /tmp/agent-calls | paste -sd, -)" = "cancel,cancel,notify" ] || { echo "FAIL: failed cancels: $(cat /tmp/agent-calls)" >&2; exit 1; }
+          [ "$(grep -c 'could not stop' /tmp/agent-syslog)" = 2 ] || { echo "FAIL: each failed cancel is logged" >&2; exit 1; }
 
           # A refused acknowledge must not lose the alert: on the refusals that
           # create nothing, resend once without acknowledge and tags. Never after
@@ -632,6 +688,42 @@ jobs:
             if (count(file("/tmp/agent.log")) !== 2) { fail("no resend after a stale slug"); }
             $a = sent(0); $b = sent(1);
             if (($a["activity_slug"] ?? "") !== "tower-array" || isset($b["activity_slug"]) || !isset($b["acknowledge"])) { fail("stale slug resend: " . json_encode($b)); }'
+
+          # An organization key can not send encrypted notifications, and the
+          # server refuses each one with 422 encryption_unavailable. The alert
+          # still goes out, once more, as the content-free alert, without what
+          # an earlier refusal already dropped.
+          printf 'PUSHWARD_API_KEY="hlk_x"\nPUSHWARD_SERVER_NAME="Tower"\nPUSHWARD_ACK="1"\nPUSHWARD_E2E_KEY="%s"\n' "$KEY_A" > /tmp/agent.cfg
+          org() {  # event, statuses, refusal codes, expected sends as encrypted|plain + ack|- (+slug)
+            : > /tmp/agent.log; : > /tmp/agent-syslog
+            bodies=""; for c in $3; do bodies="$bodies {\"code\":\"$c\"}"; done
+            STUB_CODES="$2" STUB_BODIES="$bodies" EVENT="$1" SUBJECT="Alert [T] - secret subject" IMPORTANCE=alert \
+              CONTENT="secret content" LINK=x TIMESTAMP=1 bash /tmp/plg/PushWard
+            got="$(php -r 'require "/tmp/pw1-open.php";
+              foreach (file("/tmp/agent.log") as $i => $line) {
+                $j = sent($i);
+                $kind = isset($j["encrypted"]) ? "encrypted" : (($j["body"] ?? "") === "Encryption is not available for organization keys, check the PushWard plugin settings" ? "plain" : "other");
+                $out[] = $kind . "+" . (isset($j["acknowledge"]) ? "ack" : "-") . (isset($j["activity_slug"]) ? "+slug" : "");
+              }
+              echo implode(",", $out);')"
+            [ "$got" = "$4" ] || { echo "FAIL: organization key [$2 / $3] -> '$got', want '$4'" >&2; exit 1; }
+            # Every send, the content-free resend included, keeps the keyed event
+            # tag as collapse id and second tag, and nothing names the event.
+            php -r 'require "/tmp/pw1-open.php";
+              foreach (file("/tmp/agent.log") as $i => $line) {
+                $j = sent($i);
+                if (($j["collapse_id"] ?? "") !== $argv[1]) { fail("send $i collapse_id " . ($j["collapse_id"] ?? "-") . ", want $argv[1]"); }
+                if (isset($j["acknowledge"]) && ($j["tags"][1] ?? "") !== $argv[1]) { fail("send $i tags " . json_encode($j["tags"] ?? null)); }
+                if (stripos($line, "parity") !== false) { fail("send $i names the event"); }
+              }' -- "$(hetag Tower "$1" "$KEY_A")"
+            case "$(cat /tmp/agent.log)" in *secret*) echo "FAIL: the organization resend leaked the alert" >&2; exit 1 ;; esac
+            case "$(cat /tmp/agent-syslog)" in *organization*) ;; *) echo "FAIL: no log line for the organization key" >&2; exit 1 ;; esac
+          }
+          org e "422 200" notification.encryption_unavailable "encrypted+ack,plain+ack"
+          org e "409 422 200" "notification_receipt.limit_exceeded notification.encryption_unavailable" "encrypted+ack,encrypted+-,plain+-"
+          org "Unraid Parity-Check" "422 422 409 200" \
+            "notification.activity_not_found notification.encryption_unavailable notification_receipt.limit_exceeded" \
+            "encrypted+ack+slug,encrypted+ack,plain+ack,plain+-"
           echo "encryption and acknowledge ok"
 
       - name: Lint PHP and the page JS

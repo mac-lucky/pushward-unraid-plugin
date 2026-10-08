@@ -86,23 +86,29 @@ if [ "$PUSHWARD_ACK" = "1" ] && [ "$IS_ALERT" = "1" ]; then ACK=1; fi
 # Keying on EVENT alone and not EVENT+SUBJECT is deliberate: the SMART subject
 # embeds the ticking raw attribute value, so a subject-derived key would change
 # on every repeat and stack again.
+#
+# The exception is "Unraid Status", which notify fills in when the caller gives
+# no -e (User Scripts and many plugins). Those are unrelated notifications under
+# one name, so their subject joins the event: otherwise each would replace the
+# last one's banner, take over its repeats, or cancel them.
+EVENT_KEY="${EVENT:-}"
+GENERIC_EVENT=0
+if [ "$(printf '%s' "$EVENT_KEY" | tr '[:upper:]' '[:lower:]')" = "unraid status" ]; then
+  EVENT_KEY="$EVENT_KEY|${SUBJECT:-}"
+  GENERIC_EVENT=1
+fi
 COLLAPSE_ID=""
-if [ -n "${EVENT:-}" ]; then
+if [ -n "$EVENT_KEY" ]; then
   slugify() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed -e 's/[^a-z0-9]\{1,\}/-/g' -e 's/^-//' -e 's/-$//'; }
   COLLAPSE_ID="$(slugify "$SERVER_NAME-$EVENT")"
   # 64 is the server cap. Keep a readable prefix and make the tail collision-safe
-  # rather than truncating two long events onto the same key.
-  if [ "${#COLLAPSE_ID}" -gt 64 ]; then
-    COLLAPSE_ID="$(printf '%s' "$COLLAPSE_ID" | cut -c1-31)-$(printf '%s\0%s' "$SERVER_NAME" "$EVENT" | sha1sum | cut -c1-32)"
+  # rather than truncating two long events onto the same key. A generic subject
+  # always goes into the hash and never the slug: a slug keeps only a-z and 0-9,
+  # so subjects in another script, or that differ in accents or punctuation,
+  # would all come out the same.
+  if [ "$GENERIC_EVENT" = "1" ] || [ "${#COLLAPSE_ID}" -gt 64 ]; then
+    COLLAPSE_ID="$(printf '%s' "$COLLAPSE_ID" | cut -c1-31)-$(printf '%s\0%s' "$SERVER_NAME" "$EVENT_KEY" | sha1sum | cut -c1-32)"
   fi
-fi
-
-# One tag per event: a notice about the same event that is not an alert (the
-# "returned to normal" one) cancels that alert's repeats by it. Sealed sends
-# also use it as their collapse id, so the event name stays out of both.
-EVENT_TAG=""
-if [ -n "${EVENT:-}" ]; then
-  EVENT_TAG="unraid-$(printf '%s|%s' "$SERVER_NAME" "$EVENT" | sha1sum | cut -c1-16)"
 fi
 
 # Deep-link the notification into the Live Activity the monitor daemon is
@@ -147,14 +153,17 @@ fi
 # envelope that only the user's devices can open, and the event name stays out
 # of everything the server reads. When the key is unusable (exit 3) or sealing
 # fails (exit 4) it still prints a content-free alert, so the phone hears that
-# something happened without the details going out in the clear.
-# shellcheck disable=SC2016
-payload="$(SERVER_NAME="$SERVER_NAME" LEVEL="$LEVEL" COLLAPSE_ID="$COLLAPSE_ID" ACTIVITY_SLUG="$ACTIVITY_SLUG" \
-  EVENT_TAG="$EVENT_TAG" E2E_KEY="$PUSHWARD_E2E_KEY" WEBUI_URL="$PUSHWARD_WEBUI_URL" \
-  ACK="$ACK" ACK_REPEAT="$PUSHWARD_ACK_REPEAT" ACK_EXPIRE="$PUSHWARD_ACK_EXPIRE" php -r '
-  // stdout is the payload: a PHP warning printed there would corrupt it.
-  ini_set("display_errors", "stderr");
-
+# something happened without the details going out in the clear; build org
+# prints the one an organization key gets (exit 5), since the server refuses
+# its encrypted sends. The first line printed is the event tag, the second the
+# payload; display_errors goes to stderr because a PHP warning on stdout would
+# corrupt both.
+build() {  # [org]
+  # shellcheck disable=SC2016
+  SERVER_NAME="$SERVER_NAME" LEVEL="$LEVEL" COLLAPSE_ID="$COLLAPSE_ID" ACTIVITY_SLUG="$ACTIVITY_SLUG" \
+  EVENT_KEY="$EVENT_KEY" E2E_KEY="$PUSHWARD_E2E_KEY" E2E_REFUSED="${1:-}" WEBUI_URL="$PUSHWARD_WEBUI_URL" \
+  ACK="$ACK" ACK_REPEAT="$PUSHWARD_ACK_REPEAT" ACK_EXPIRE="$PUSHWARD_ACK_EXPIRE" \
+  php -d display_errors=stderr -r '
   // pw-e2e begin
   // PushWard end-to-end encryption (envelope pw1), inline because this agent
   // runs from the flash drive and must not depend on the plugin directory. CI
@@ -275,12 +284,29 @@ payload="$(SERVER_NAME="$SERVER_NAME" LEVEL="$LEVEL" COLLAPSE_ID="$COLLAPSE_ID" 
     return preg_match($abs, $url) ? $url : "";
   }
 
+  // One tag per event: the notice that an event is back to normal cancels the
+  // repeats of its alert by it, and sealed sends use it as their collapse id. With a
+  // usable key it is an HMAC under a key derived from it, so nobody can hash a
+  // list of likely event names until one matches; without one, a plain sha1.
+  // Firing and recovery derive it from the same inputs. "" without an event.
+  function pw_event_tag(string $server, string $event, string $key): string {
+    if ($event === "") { return ""; }
+    try {
+      $mac = hash_hmac("sha256", $server . "|" . $event, hash_hkdf("sha256", pw_e2e_key($key), 32, "pushward/unraid/v1/event-tag"));
+    } catch (Throwable $e) {
+      $mac = sha1($server . "|" . $event);
+    }
+    return "unraid-" . substr($mac, 0, 16);
+  }
+
   function pw_seconds(string $name, int $default, int $min, int $max): int {
     $v = (string) getenv($name);
     return max($min, min($max, preg_match("/^[0-9]{1,9}\\z/", $v) ? (int) $v : $default));
   }
 
   $server = pw_env("SERVER_NAME");
+  $key = (string) getenv("E2E_KEY");
+  $eventTag = pw_event_tag((string) getenv("SERVER_NAME"), (string) getenv("EVENT_KEY"), $key);
   $title = pw_env("SUBJECT");
   if ($title === "") $title = pw_env("EVENT");
   if ($title === "") $title = "Unraid notification";
@@ -319,13 +345,12 @@ payload="$(SERVER_NAME="$SERVER_NAME" LEVEL="$LEVEL" COLLAPSE_ID="$COLLAPSE_ID" 
       ],
       "tags" => array_values(array_filter([
         substr("unraid-" . ($slug !== "" ? $slug : substr(sha1($server), 0, 12)), 0, 64),
-        (string) getenv("EVENT_TAG"),
+        $eventTag,
       ], fn($v) => $v !== "")),
     ];
   }
 
   $status = 0;
-  $key = (string) getenv("E2E_KEY");
   if ($key === "") {
     $msg = ["title" => $title, "subtitle" => $subtitle, "body" => $body] + $delivery + [
       "url"      => pw_link(),
@@ -338,8 +363,11 @@ payload="$(SERVER_NAME="$SERVER_NAME" LEVEL="$LEVEL" COLLAPSE_ID="$COLLAPSE_ID" 
     // The event name is the one detail outside the envelope, so it leaves the
     // metadata and the collapse id becomes the hash in the event tag.
     unset($meta["event"]);
-    $collapse = (string) getenv("EVENT_TAG");
+    $collapse = $eventTag;
     try {
+      if (getenv("E2E_REFUSED") === "org") {
+        throw new DomainException("organization keys can not send encrypted notifications");
+      }
       $sealKey = pw_e2e_key($key);
       $subtitle = implode(array_slice(pw_e2e_chars($subtitle), 0, 256));
       try {
@@ -351,24 +379,38 @@ payload="$(SERVER_NAME="$SERVER_NAME" LEVEL="$LEVEL" COLLAPSE_ID="$COLLAPSE_ID" 
       $msg = ["encrypted" => $sealed] + $delivery + ["metadata" => (object) $meta]
         + $nonEmpty(["collapse_id" => $collapse, "activity_slug" => (string) getenv("ACTIVITY_SLUG")]);
     } catch (Throwable $e) {
-      $status = $e instanceof InvalidArgumentException ? 3 : 4;
+      $status = match (true) {
+        $e instanceof InvalidArgumentException => 3,
+        $e instanceof DomainException => 5,
+        default => 4,
+      };
       $msg = [
         "title" => "Unraid alert on " . $server,
-        "body"  => $status === 3
-          ? "Encryption key invalid, check the PushWard plugin settings"
-          : "Encryption unavailable on this server, check the PushWard plugin settings",
+        "body"  => [
+          3 => "Encryption key invalid, check the PushWard plugin settings",
+          4 => "Encryption unavailable on this server, check the PushWard plugin settings",
+          5 => "Encryption is not available for organization keys, check the PushWard plugin settings",
+        ][$status],
       ] + $delivery + ["metadata" => (object) $meta] + $nonEmpty(["collapse_id" => $collapse]);
     }
   }
   $json = json_encode($msg + $ack, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_INVALID_UTF8_SUBSTITUTE);
   if ($json === false) { fwrite(STDERR, json_last_error_msg()); exit(1); }
-  echo $json;
+  echo $eventTag, "\n", $json;
   exit($status);
-')"
+'
+}
+split_build() {  # $1 = what build printed -> sets EVENT_TAG and payload; fails when it is malformed
+  EVENT_TAG="${1%%$'\n'*}"
+  payload="${1#*$'\n'}"
+  [[ $EVENT_TAG =~ ^(unraid-[0-9a-f]{16})?$ ]] && [ "$payload" != "$1" ] && [ -n "$payload" ]
+}
+out="$(build)"
 built=$?
 
-# Never POST an empty body (the server would 4xx and the alert would vanish).
-if [ -z "$payload" ]; then
+# Never POST an empty or garbled body (the server would 4xx and the alert would
+# vanish).
+if ! split_build "$out"; then
   logger -t pushward "notification payload could not be built; alert NOT sent (subject: ${SUBJECT:-?})"
   exit 0
 fi
@@ -403,8 +445,7 @@ resp_code() {  # -> the problem code of the last response, or nothing
 
 drop_keys() {  # $1 = payload, then keys -> the keys it dropped on one line, then the payload
   # shellcheck disable=SC2016
-  printf '%s' "$1" | php -r '
-    ini_set("display_errors", "stderr");
+  printf '%s' "$1" | php -d display_errors=stderr -r '
     $j = json_decode((string) stream_get_contents(STDIN));
     if (!is_object($j)) { exit(1); }
     $gone = [];
@@ -420,16 +461,26 @@ drop_keys() {  # $1 = payload, then keys -> the keys it dropped on one line, the
 # A notice about an event that is not an alert (Unraid's "returned to normal")
 # first stops that event's repeating alert: the repeats share its collapse id,
 # so one landing after the notice would put the alert back on the Lock Screen.
-# Best effort and 5 seconds at most; the notice goes out whatever happens here.
-if [ "$PUSHWARD_ACK" = "1" ] && [ "$IS_ALERT" = "0" ] && [ -n "$EVENT_TAG" ]; then
-  canceled="$(curl -sS -m 5 -o /dev/null -w '%{http_code}' -X POST "$URL/notifications/receipts/cancel" \
-    -H "Authorization: Bearer $PUSHWARD_API_KEY" \
-    -H "Content-Type: application/json" \
-    -d "{\"tag\":\"$EVENT_TAG\"}" 2>/dev/null)" || canceled="000"
-  case "$canceled" in
-    2*) ;;
-    *) logger -t pushward "could not stop the repeats tagged $EVENT_TAG (HTTP ${canceled:-000}); sending the notice anyway" ;;
-  esac
+# Best effort and 5 seconds at most each; the notice goes out whatever happens
+# here. Never for a generic "Unraid Status" notice: it has no alert of its own.
+#
+# 2026.10.08 tagged alerts with a plain sha1 even with an encryption key, so an
+# alert repeating since before the upgrade carries that tag; it is canceled too.
+# Repeats expire within 3 hours, so a later release can drop the second call.
+if [ "$PUSHWARD_ACK" = "1" ] && [ "$IS_ALERT" = "0" ] && [ "$GENERIC_EVENT" = "0" ] && [ -n "$EVENT_TAG" ]; then
+  tags=("$EVENT_TAG")
+  legacy="unraid-$(printf '%s|%s' "$SERVER_NAME" "$EVENT_KEY" | sha1sum | cut -c1-16)"
+  [ "$legacy" = "$EVENT_TAG" ] || tags+=("$legacy")
+  for tag in "${tags[@]}"; do
+    canceled="$(curl -sS -m 5 -o /dev/null -w '%{http_code}' -X POST "$URL/notifications/receipts/cancel" \
+      -H "Authorization: Bearer $PUSHWARD_API_KEY" \
+      -H "Content-Type: application/json" \
+      -d "{\"tag\":\"$tag\"}" 2>/dev/null)" || canceled="000"
+    case "$canceled" in
+      2*) ;;
+      *) logger -t pushward "could not stop the repeats tagged $tag (HTTP ${canceled:-000}); sending the notice anyway" ;;
+    esac
+  done
 fi
 
 code="$(post "$payload")"
@@ -442,11 +493,22 @@ code="$(post "$payload")"
 #  - an acknowledge the server will not take (receipt limit reached, receipts
 #    off, no answer URL, too large with the answer button, or rejected as
 #    invalid) goes out once more as an ordinary notification.
-# Each part is dropped at most once. A 401/403/429/5xx or network failure is
-# never resent: that would duplicate the alert or fail the same way again.
-for _ in 1 2; do
+#  - an organization key can not send encrypted notifications at all; it gets
+#    the content-free alert instead, minus whatever was dropped before.
+# Each happens at most once. A 401/403/429/5xx or network failure is never
+# resent: that would duplicate the alert or fail the same way again.
+refused=0
+for _ in 1 2 3; do
   case "$code" in 400 | 409 | 422) ;; *) break ;; esac
   rcode="$(resp_code)"
+  if [ "$code:$rcode" = "422:notification.encryption_unavailable" ] && [ "$refused" = "0" ]; then
+    refused=1
+    logger -t pushward "this API key belongs to an organization, which can not send encrypted notifications; resending as a content-free alert (remove the encryption key or use a personal API key)"
+    out="$(build org)"
+    split_build "$out" || break
+    code="$(post "$payload")"
+    continue
+  fi
   drop=()
   if [ "$code" = "422" ] && { [ -z "$rcode" ] || [ "$rcode" = "notification.activity_not_found" ]; }; then
     drop+=(activity_slug)
@@ -463,7 +525,9 @@ for _ in 1 2; do
     *" activity_slug "*) logger -t pushward "notification rejected with a stale activity_slug ($ACTIVITY_SLUG); retrying without it" ;;
   esac
   case " ${out%%$'\n'*} " in
-    *" acknowledge "*) logger -t pushward "acknowledge refused (HTTP $code${rcode:+ $rcode}); resending as an ordinary notification" ;;
+    *" acknowledge "*)
+      ACK=""   # and a later rebuild leaves it out too
+      logger -t pushward "acknowledge refused (HTTP $code${rcode:+ $rcode}); resending as an ordinary notification" ;;
   esac
   payload="${out#*$'\n'}"
   code="$(post "$payload")"
@@ -473,9 +537,6 @@ case "$code" in
   2*) ;;
   *)
     rcode="$(resp_code)"
-    if [ "$rcode" = "notification.encryption_unavailable" ]; then
-      logger -t pushward "this API key belongs to an organization, which can not send encrypted notifications; remove the encryption key or use a personal API key"
-    fi
     logger -t pushward "notification delivery to PushWard failed (HTTP $code${rcode:+ $rcode}; subject: ${SUBJECT:-?})" ;;
 esac
 
