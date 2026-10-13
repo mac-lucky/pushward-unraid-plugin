@@ -3,7 +3,7 @@
 <!DOCTYPE PLUGIN [
 <!ENTITY name      "pushward-unraid">
 <!ENTITY author    "mac-lucky">
-<!ENTITY version   "2026.10.08a">
+<!ENTITY version   "2026.10.13">
 <!ENTITY gitURL    "https://github.com/mac-lucky/pushward-unraid-plugin">
 <!ENTITY pluginURL "&gitURL;/raw/main/pushward-unraid.plg">
 <!ENTITY supportURL "&gitURL;/issues">
@@ -18,10 +18,13 @@
         min="6.12">
 
 <CHANGES>
+###2026.10.13
+- Organization API keys can send encrypted notifications now: paste the organization's key from its admin, and members read them once they add it in PushWard 1.18 or later
+- If PushWard turns encryption for organizations off again, the content-free alert and the syslog now say so
 ###2026.10.08a
 - Notifications from User Scripts and other plugins that do not name their own event no longer replace each other's banner or stop each other's repeats
 - With an encryption key set, the hash that stands in for the event name is now keyed with it, so it can not be matched against a list of likely event names
-- An organization API key with an encryption key set now delivers a content-free alert instead of nothing; organizations can not send encrypted notifications
+- An organization API key with an encryption key set now delivers a content-free alert instead of nothing; organizations could not send encrypted notifications yet
 ###2026.10.08
 - Optional end-to-end encryption: paste the key from the PushWard app (1.17 or later) and the title, subtitle, body and link of every notification are encrypted on this server before they leave it, so only your devices can read them
 - PushWard still sees the level, server name, timestamp and importance; Live Activities and widgets are not encrypted
@@ -311,10 +314,10 @@ fi
 # of everything the server reads. When the key is unusable (exit 3) or sealing
 # fails (exit 4) it still prints a content-free alert, so the phone hears that
 # something happened without the details going out in the clear; build org
-# prints the one an organization key gets (exit 5), since the server refuses
-# its encrypted sends. The first line printed is the event tag, the second the
-# payload; display_errors goes to stderr because a PHP warning on stdout would
-# corrupt both.
+# prints the one an organization key gets (exit 5) when PushWard has not
+# enabled encryption for organizations and refuses its encrypted sends. The
+# first line printed is the event tag, the second the payload; display_errors
+# goes to stderr because a PHP warning on stdout would corrupt both.
 build() {  # [org]
   # shellcheck disable=SC2016
   SERVER_NAME="$SERVER_NAME" LEVEL="$LEVEL" COLLAPSE_ID="$COLLAPSE_ID" ACTIVITY_SLUG="$ACTIVITY_SLUG" \
@@ -523,7 +526,7 @@ build() {  # [org]
     $collapse = $eventTag;
     try {
       if (getenv("E2E_REFUSED") === "org") {
-        throw new DomainException("organization keys can not send encrypted notifications");
+        throw new DomainException("PushWard has not enabled encryption for organizations yet");
       }
       $sealKey = pw_e2e_key($key);
       $subtitle = implode(array_slice(pw_e2e_chars($subtitle), 0, 256));
@@ -546,7 +549,7 @@ build() {  # [org]
         "body"  => [
           3 => "Encryption key invalid, check the PushWard plugin settings",
           4 => "Encryption unavailable on this server, check the PushWard plugin settings",
-          5 => "Encryption is not available for organization keys, check the PushWard plugin settings",
+          5 => "Encryption not enabled for organizations yet, check the PushWard plugin settings",
         ][$status],
       ] + $delivery + ["metadata" => (object) $meta] + $nonEmpty(["collapse_id" => $collapse]);
     }
@@ -650,8 +653,9 @@ code="$(post "$payload")"
 #  - an acknowledge the server will not take (receipt limit reached, receipts
 #    off, no answer URL, too large with the answer button, or rejected as
 #    invalid) goes out once more as an ordinary notification.
-#  - an organization key can not send encrypted notifications at all; it gets
-#    the content-free alert instead, minus whatever was dropped before.
+#  - an organization key gets 422 encryption_unavailable while PushWard has
+#    not enabled encryption for organizations; it gets the content-free alert
+#    instead, minus whatever was dropped before.
 # Each happens at most once. A 401/403/429/5xx or network failure is never
 # resent: that would duplicate the alert or fail the same way again.
 refused=0
@@ -660,7 +664,7 @@ for _ in 1 2 3; do
   rcode="$(resp_code)"
   if [ "$code:$rcode" = "422:notification.encryption_unavailable" ] && [ "$refused" = "0" ]; then
     refused=1
-    logger -t pushward "this API key belongs to an organization, which can not send encrypted notifications; resending as a content-free alert (remove the encryption key or use a personal API key)"
+    logger -t pushward "PushWard has not enabled encrypted notifications for organization API keys yet; resending as a content-free alert (remove the encryption key or use a personal API key until it does)"
     out="$(build org)"
     split_build "$out" || break
     code="$(post "$payload")"
@@ -700,7 +704,7 @@ esac
 exit 0
 ]]>
 </INLINE>
-<MD5>e87c24d8360ee0e4f4190f850add1023</MD5>
+<MD5>98b223e7f231551401f337ae43de1652</MD5>
 </FILE>
 
 <!-- 3. Test-notification helper (Settings page button). -->
@@ -3745,7 +3749,7 @@ function pwKeepKey() {
 </div>
 <div class="pw-callout">
   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg>
-  <p><strong>Encryption:</strong> create a key in the PushWard app (1.17 or later) under Settings &rarr; End-to-End Encryption and paste it above; the Key ID in the status cards should match the app. The title, subtitle, body and link of each notification are then encrypted on this server before they leave it. PushWard still reads the level, the server name, the timestamp and the importance, the name of the Live Activity a notification links to (such as tower-array) and the repeat tags, which carry the server name. Live Activities themselves (parity, mover, backups, UPS) are not encrypted. <strong>Repeat alerts:</strong> an Unraid Alert keeps coming back at the chosen interval until you tap Acknowledge on a device, or until it stops after the set time. Warnings and info never repeat.</p>
+  <p><strong>Encryption:</strong> create a key in the PushWard app (1.17 or later) under Settings &rarr; End-to-End Encryption and paste it above; the Key ID in the status cards should match the app. With an organization API key, paste the organization's key from its admin instead. The title, subtitle, body and link of each notification are then encrypted on this server before they leave it. PushWard still reads the level, the server name, the timestamp and the importance, the name of the Live Activity a notification links to (such as tower-array) and the repeat tags, which carry the server name. Live Activities themselves (parity, mover, backups, UPS) are not encrypted. <strong>Repeat alerts:</strong> an Unraid Alert keeps coming back at the chosen interval until you tap Acknowledge on a device, or until it stops after the set time. Warnings and info never repeat.</p>
 </div>
 <?PHP if ($configured): ?>
 <div class="pw-logwrap">
@@ -3799,7 +3803,7 @@ function pwKeepKey() {
 </script>
 ]]>
 </INLINE>
-<MD5>39fe350b639912767ec8b1090dee5cca</MD5>
+<MD5>fe4a33c5740dc2a217394b9001e16eae</MD5>
 </FILE>
 
 <!-- 11. Activities tab page (live dashboard). -->

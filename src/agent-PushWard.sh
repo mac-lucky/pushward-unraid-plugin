@@ -154,10 +154,10 @@ fi
 # of everything the server reads. When the key is unusable (exit 3) or sealing
 # fails (exit 4) it still prints a content-free alert, so the phone hears that
 # something happened without the details going out in the clear; build org
-# prints the one an organization key gets (exit 5), since the server refuses
-# its encrypted sends. The first line printed is the event tag, the second the
-# payload; display_errors goes to stderr because a PHP warning on stdout would
-# corrupt both.
+# prints the one an organization key gets (exit 5) when PushWard has not
+# enabled encryption for organizations and refuses its encrypted sends. The
+# first line printed is the event tag, the second the payload; display_errors
+# goes to stderr because a PHP warning on stdout would corrupt both.
 build() {  # [org]
   # shellcheck disable=SC2016
   SERVER_NAME="$SERVER_NAME" LEVEL="$LEVEL" COLLAPSE_ID="$COLLAPSE_ID" ACTIVITY_SLUG="$ACTIVITY_SLUG" \
@@ -366,7 +366,7 @@ build() {  # [org]
     $collapse = $eventTag;
     try {
       if (getenv("E2E_REFUSED") === "org") {
-        throw new DomainException("organization keys can not send encrypted notifications");
+        throw new DomainException("PushWard has not enabled encryption for organizations yet");
       }
       $sealKey = pw_e2e_key($key);
       $subtitle = implode(array_slice(pw_e2e_chars($subtitle), 0, 256));
@@ -389,7 +389,7 @@ build() {  # [org]
         "body"  => [
           3 => "Encryption key invalid, check the PushWard plugin settings",
           4 => "Encryption unavailable on this server, check the PushWard plugin settings",
-          5 => "Encryption is not available for organization keys, check the PushWard plugin settings",
+          5 => "Encryption not enabled for organizations yet, check the PushWard plugin settings",
         ][$status],
       ] + $delivery + ["metadata" => (object) $meta] + $nonEmpty(["collapse_id" => $collapse]);
     }
@@ -493,8 +493,9 @@ code="$(post "$payload")"
 #  - an acknowledge the server will not take (receipt limit reached, receipts
 #    off, no answer URL, too large with the answer button, or rejected as
 #    invalid) goes out once more as an ordinary notification.
-#  - an organization key can not send encrypted notifications at all; it gets
-#    the content-free alert instead, minus whatever was dropped before.
+#  - an organization key gets 422 encryption_unavailable while PushWard has
+#    not enabled encryption for organizations; it gets the content-free alert
+#    instead, minus whatever was dropped before.
 # Each happens at most once. A 401/403/429/5xx or network failure is never
 # resent: that would duplicate the alert or fail the same way again.
 refused=0
@@ -503,7 +504,7 @@ for _ in 1 2 3; do
   rcode="$(resp_code)"
   if [ "$code:$rcode" = "422:notification.encryption_unavailable" ] && [ "$refused" = "0" ]; then
     refused=1
-    logger -t pushward "this API key belongs to an organization, which can not send encrypted notifications; resending as a content-free alert (remove the encryption key or use a personal API key)"
+    logger -t pushward "PushWard has not enabled encrypted notifications for organization API keys yet; resending as a content-free alert (remove the encryption key or use a personal API key until it does)"
     out="$(build org)"
     split_build "$out" || break
     code="$(post "$payload")"

@@ -689,10 +689,10 @@ jobs:
             $a = sent(0); $b = sent(1);
             if (($a["activity_slug"] ?? "") !== "tower-array" || isset($b["activity_slug"]) || !isset($b["acknowledge"])) { fail("stale slug resend: " . json_encode($b)); }'
 
-          # An organization key can not send encrypted notifications, and the
-          # server refuses each one with 422 encryption_unavailable. The alert
-          # still goes out, once more, as the content-free alert, without what
-          # an earlier refusal already dropped.
+          # While PushWard has encryption for organizations switched off, the
+          # server refuses an organization key's encrypted send with 422
+          # encryption_unavailable. The alert still goes out, once more, as the
+          # content-free alert, without what an earlier refusal already dropped.
           printf 'PUSHWARD_API_KEY="hlk_x"\nPUSHWARD_SERVER_NAME="Tower"\nPUSHWARD_ACK="1"\nPUSHWARD_E2E_KEY="%s"\n' "$KEY_A" > /tmp/agent.cfg
           org() {  # event, statuses, refusal codes, expected sends as encrypted|plain + ack|- (+slug)
             : > /tmp/agent.log; : > /tmp/agent-syslog
@@ -702,7 +702,7 @@ jobs:
             got="$(php -r 'require "/tmp/pw1-open.php";
               foreach (file("/tmp/agent.log") as $i => $line) {
                 $j = sent($i);
-                $kind = isset($j["encrypted"]) ? "encrypted" : (($j["body"] ?? "") === "Encryption is not available for organization keys, check the PushWard plugin settings" ? "plain" : "other");
+                $kind = isset($j["encrypted"]) ? "encrypted" : (($j["body"] ?? "") === "Encryption not enabled for organizations yet, check the PushWard plugin settings" ? "plain" : "other");
                 $out[] = $kind . "+" . (isset($j["acknowledge"]) ? "ack" : "-") . (isset($j["activity_slug"]) ? "+slug" : "");
               }
               echo implode(",", $out);')"

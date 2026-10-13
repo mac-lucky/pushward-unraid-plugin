@@ -4,7 +4,7 @@
 set -euo pipefail
 SRC="$(cd "$(dirname "$0")/src" && pwd)"
 OUT="${1:-$(dirname "$0")/pushward-unraid.plg}"
-VERSION="2026.10.08a"
+VERSION="2026.10.13"
 
 # Guard: a literal ]]> in any embedded TEXT file would break its CDATA section.
 # Skip *.png: the icon is base64-encoded (icon_file), never embedded raw, so a
@@ -75,9 +75,12 @@ cat <<XMLHEAD
 
 <CHANGES>
 ###$VERSION
+- Organization API keys can send encrypted notifications now: paste the organization's key from its admin, and members read them once they add it in PushWard 1.18 or later
+- If PushWard turns encryption for organizations off again, the content-free alert and the syslog now say so
+###2026.10.08a
 - Notifications from User Scripts and other plugins that do not name their own event no longer replace each other's banner or stop each other's repeats
 - With an encryption key set, the hash that stands in for the event name is now keyed with it, so it can not be matched against a list of likely event names
-- An organization API key with an encryption key set now delivers a content-free alert instead of nothing; organizations can not send encrypted notifications
+- An organization API key with an encryption key set now delivers a content-free alert instead of nothing; organizations could not send encrypted notifications yet
 ###2026.10.08
 - Optional end-to-end encryption: paste the key from the PushWard app (1.17 or later) and the title, subtitle, body and link of every notification are encrypted on this server before they leave it, so only your devices can read them
 - PushWard still sees the level, server name, timestamp and importance; Live Activities and widgets are not encrypted
