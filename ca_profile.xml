@@ -1,8 +1,8 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <CommunityApplications>
   <Profile>
-    PushWard connects an Unraid server to the PushWard iOS app. It forwards every
-    Unraid notification to your iPhone and drives Live Activities for long-running
+    PushWard connects an Unraid server to the PushWard app. It forwards every
+    Unraid notification to your phone and drives Live Activities for long-running
     jobs: parity check and rebuild, appdata backup, mover, VM backup, and UPS on
     battery. Self-contained, no downloaded binary and no Unraid API key. Report
     issues on GitHub at the link below.

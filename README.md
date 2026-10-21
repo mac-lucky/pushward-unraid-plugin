@@ -4,7 +4,7 @@
 
 A self-contained Unraid plugin that connects your server to [PushWard](https://pushward.app). It does three things.
 
-**Notifications.** Every Unraid notification is forwarded to your iPhone.
+**Notifications.** Every Unraid notification is forwarded to your phone.
 
 **Live Activities.** Long-running jobs (parity check/rebuild, appdata backup, mover, VM backup, UPS on battery) show real-time progress on the Lock Screen and Dynamic Island, with a dashboard page to view and end them.
 
@@ -104,7 +104,7 @@ A few notes on the newer sources. Mover lists the files as they move, read from 
 
 ### Home Screen widgets
 
-Off by default, because they need an extra permission on your key (see above) and they occupy space in your iPhone's widget picker whether or not you place them. Switch them on under Settings and the monitor publishes three:
+Off by default, because they need an extra permission on your key (see above) and they occupy space in your phone's widget picker whether or not you place them. Switch them on under Settings and the monitor publishes three:
 
 | Widget | Template | Shows |
 |---|---|---|
@@ -112,7 +112,7 @@ Off by default, because they need an extra permission on your key (see above) an
 | `<server>-storage` | battery | A ring per mounted disk and pool, plus the UPS, showing free space rather than used. A disk with a SMART fault or a read error goes red whatever its level. Eight rings is the server's limit, so a box with more devices than that shows the unhealthy ones first, then whichever have least room left |
 | `<server>-status` | stat_list | Array state, used and free, the last parity result with how long ago it ran, mover, and how many disks are healthy |
 
-Everything comes from the status files Unraid already keeps up to date, so a refresh never spins a disk up to read it. Widgets refresh on their own interval (default 300s) rather than the activity poll, and re-send unchanged content twice an hour so iOS does not grey them out as stale; the server counts that as a touch, not a push, so it costs nothing against your quota. Switching them back off removes them from your account.
+Everything comes from the status files Unraid already keeps up to date, so a refresh never spins a disk up to read it. Widgets refresh on their own interval (default 300s) rather than the activity poll, and re-send unchanged content twice an hour so the app does not grey them out as stale; the server counts that as a touch, not a push, so it costs nothing against your quota. Switching them back off removes them from your account.
 
 ## Uninstall
 
